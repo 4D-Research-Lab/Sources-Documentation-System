@@ -177,12 +177,15 @@ def file_extension_for_format(fmt):
 
 def source_passes_filter(src, lib):
     """Return True if src matches all active filters on the library."""
+    f_inv      = lib.filter_inventory_nr.strip().lower()
     f_title    = lib.filter_title.strip().lower()
     f_toponym  = lib.filter_toponym.strip().lower()
     f_date     = lib.filter_date.strip().lower()
     f_type     = lib.filter_type       # enum value or "ALL"
     f_rel      = lib.filter_reliability  # enum value or "ALL"
 
+    if f_inv     and f_inv     not in src.inventory_nr.lower():
+        return False
     if f_title   and f_title   not in src.title.lower():
         return False
     if f_toponym and f_toponym not in src.toponym.lower():
@@ -198,6 +201,7 @@ def source_passes_filter(src, lib):
 
 def filters_active(lib):
     return (
+        lib.filter_inventory_nr.strip() != "" or
         lib.filter_title.strip()    != "" or
         lib.filter_toponym.strip()  != "" or
         lib.filter_date.strip()     != "" or
@@ -287,6 +291,7 @@ class HistoricalSourceLibrary(PropertyGroup):
         description="Sort the source library list",
     )
     # --- filter fields ---
+    filter_inventory_nr:StringProperty(name="Inventory No.", default="", description="Filter by inventory number (substring, case-insensitive)")
     filter_title:       StringProperty(name="Title",    default="",    description="Filter by title (substring, case-insensitive)")
     filter_toponym:     StringProperty(name="Toponym",  default="",    description="Filter by toponym (substring, case-insensitive)")
     filter_date:        StringProperty(name="Date",     default="",    description="Filter by date string (substring, case-insensitive)")
@@ -347,7 +352,9 @@ class HIST_UL_LibraryList(UIList):
         row.active = passes
         if self.layout_type in {"DEFAULT", "COMPACT"}:
             row.label(text="", icon=SOURCE_TYPE_ICONS.get(item.source_type, "QUESTION"))
-            row.prop(item, "title", text="", emboss=False)
+            inv_col = row.row(align=True)
+            inv_col.ui_units_x = 6
+            inv_col.label(text=item.inventory_nr if item.inventory_nr else "-")
             topo_col = row.row(align=True)
             topo_col.ui_units_x = 5
             topo_col.label(text=item.toponym if item.toponym else "-")
@@ -355,6 +362,11 @@ class HIST_UL_LibraryList(UIList):
             date_col.ui_units_x = 4
             date_col.label(text=item.date if item.date else "-")
             row.label(text="", icon=RELIABILITY_ICONS.get(item.reliability, "QUESTION"))
+            if is_url(item.url):
+                op = row.operator("hist.open_url", text="", icon="URL", emboss=False)
+                op.url = item.url
+            else:
+                row.label(text="", icon="BLANK1")  # keeps row width stable
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text="", icon=SOURCE_TYPE_ICONS.get(item.source_type, "QUESTION"))
@@ -1038,6 +1050,7 @@ class HIST_PT_LibraryPanel(Panel):
 
         if lib.show_filters:
             col = box.column(align=True)
+            col.prop(lib, "filter_inventory_nr", icon="SHORTDISPLAY")
             col.prop(lib, "filter_title",   icon="SORTALPHA")
             col.prop(lib, "filter_toponym", icon="WORLD")
             col.prop(lib, "filter_date",    icon="TIME")
