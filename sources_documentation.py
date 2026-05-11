@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Historical Source Documentation",
     "author": "Your Name",
-    "version": (1, 7, 7),
+    "version": (1, 7, 9),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Hist. Sources",
     "description": "Document historical sources for architectural reconstruction",
@@ -175,6 +175,37 @@ def file_extension_for_format(fmt):
     return ".glb" if fmt == "GLB" else ".gltf"
 
 
+def source_passes_filter(src, lib):
+    """Return True if src matches all active filters on the library."""
+    f_title    = lib.filter_title.strip().lower()
+    f_toponym  = lib.filter_toponym.strip().lower()
+    f_date     = lib.filter_date.strip().lower()
+    f_type     = lib.filter_type       # enum value or "ALL"
+    f_rel      = lib.filter_reliability  # enum value or "ALL"
+
+    if f_title   and f_title   not in src.title.lower():
+        return False
+    if f_toponym and f_toponym not in src.toponym.lower():
+        return False
+    if f_date    and f_date    not in src.date.lower():
+        return False
+    if f_type != "ALL"  and src.source_type != f_type:
+        return False
+    if f_rel  != "ALL"  and src.reliability  != f_rel:
+        return False
+    return True
+
+
+def filters_active(lib):
+    return (
+        lib.filter_title.strip()    != "" or
+        lib.filter_toponym.strip()  != "" or
+        lib.filter_date.strip()     != "" or
+        lib.filter_type             != "ALL" or
+        lib.filter_reliability      != "ALL"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Post-export extras injection
 # ---------------------------------------------------------------------------
@@ -240,6 +271,12 @@ class HistoricalSource(PropertyGroup):
     description:  StringProperty(name="Description",          default="")
     notes:        StringProperty(name="Notes",                default="")
 
+
+# Filter type/reliability enums include an "ALL" sentinel
+FILTER_TYPE_ITEMS = [("ALL", "All Types", "")] + list(SOURCE_TYPES)
+FILTER_REL_ITEMS  = [("ALL", "All",       "")] + list(RELIABILITY)
+
+
 class HistoricalSourceLibrary(PropertyGroup):
     sources:      CollectionProperty(type=HistoricalSource)
     active_index: IntProperty(name="Active Library Index", default=0)
@@ -249,6 +286,14 @@ class HistoricalSourceLibrary(PropertyGroup):
         default="NONE",
         description="Sort the source library list",
     )
+    # --- filter fields ---
+    filter_title:       StringProperty(name="Title",    default="",    description="Filter by title (substring, case-insensitive)")
+    filter_toponym:     StringProperty(name="Toponym",  default="",    description="Filter by toponym (substring, case-insensitive)")
+    filter_date:        StringProperty(name="Date",     default="",    description="Filter by date string (substring, case-insensitive)")
+    filter_type:        EnumProperty(  name="Type",     items=FILTER_TYPE_ITEMS, default="ALL", description="Filter by source type")
+    filter_reliability: EnumProperty(  name="Reliability", items=FILTER_REL_ITEMS,  default="ALL", description="Filter by reliability")
+    show_filters:       BoolProperty(  name="Show Filters", default=False)
+
 
 class ObjectSourceRef(PropertyGroup):
     source_id: StringProperty(name="Source ID", default="")
@@ -295,8 +340,12 @@ class HistImportSettings(PropertyGroup):
 
 class HIST_UL_LibraryList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        lib = context.scene.hist_source_library
+        # Grey out rows that don't pass the current filter
+        row = layout.row(align=True)
+        passes = source_passes_filter(item, lib)
+        row.active = passes
         if self.layout_type in {"DEFAULT", "COMPACT"}:
-            row = layout.row(align=True)
             row.label(text="", icon=SOURCE_TYPE_ICONS.get(item.source_type, "QUESTION"))
             row.prop(item, "title", text="", emboss=False)
             topo_col = row.row(align=True)
@@ -309,6 +358,23 @@ class HIST_UL_LibraryList(UIList):
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text="", icon=SOURCE_TYPE_ICONS.get(item.source_type, "QUESTION"))
+
+    def filter_items(self, context, data, propname):
+        """
+        Use Blender's built-in filter mechanism to hide non-matching items.
+        Returns (filter_flags, reorder_indices).
+        filter_flags: per-item bitmask — FILTER_ITEM means "show".
+        """
+        lib     = context.scene.hist_source_library
+        sources = getattr(data, propname)
+        flags   = []
+        for src in sources:
+            if source_passes_filter(src, lib):
+                flags.append(self.bitflag_filter_item)
+            else:
+                flags.append(0)
+        return flags, []
+
 
 class HIST_UL_ObjectRefList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
@@ -330,6 +396,26 @@ class HIST_UL_ObjectRefList(UIList):
                 text="",
                 icon=SOURCE_TYPE_ICONS.get(src.source_type, "QUESTION") if src else "ERROR",
             )
+
+
+# ---------------------------------------------------------------------------
+# Operators — filter clear
+# ---------------------------------------------------------------------------
+
+class HIST_OT_ClearFilters(Operator):
+    bl_idname      = "hist.clear_filters"
+    bl_label       = "Clear Filters"
+    bl_description = "Reset all library filters"
+
+    def execute(self, context):
+        lib = get_library(context)
+        lib.filter_title       = ""
+        lib.filter_toponym     = ""
+        lib.filter_date        = ""
+        lib.filter_type        = "ALL"
+        lib.filter_reliability = "ALL"
+        self.report({"INFO"}, "Filters cleared.")
+        return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
@@ -451,17 +537,9 @@ class HIST_OT_SortSources(Operator):
 
         items = [
             (
-                src.source_id,
-                src.title,
-                src.source_type,
-                src.date,
-                src.toponym,
-                src.repository,
-                src.inventory_nr,
-                src.url,
-                src.reliability,
-                src.description,
-                src.notes,
+                src.source_id, src.title, src.source_type, src.date,
+                src.toponym, src.repository, src.inventory_nr, src.url,
+                src.reliability, src.description, src.notes,
             )
             for src in lib.sources
         ]
@@ -497,7 +575,6 @@ class HIST_OT_SortSources(Operator):
                 lib.active_index = i
                 break
 
-        # Keep sort_order as-is so dropdown remembers last selection
         self.report({"INFO"}, f"Library sorted by {lib.sort_order.lower()}.")
         return {"FINISHED"}
 
@@ -511,7 +588,7 @@ class HIST_OT_LibraryExportCSV(Operator):
     bl_label       = "Export Library to CSV"
     bl_description = "Export the entire source library to a CSV file"
 
-    filepath:  StringProperty(name="File Path", subtype="FILE_PATH", default="library.csv")
+    filepath:    StringProperty(name="File Path", subtype="FILE_PATH", default="library.csv")
     filter_glob: StringProperty(default="*.csv", options={"HIDDEN"})
 
     def execute(self, context):
@@ -543,9 +620,9 @@ class HIST_OT_LibraryImportCSV(Operator):
     bl_label       = "Import Library from CSV"
     bl_description = "Import sources from a library CSV file"
 
-    filepath:     StringProperty(name="File Path", subtype="FILE_PATH")
-    filter_glob:  StringProperty(default="*.csv", options={"HIDDEN"})
-    clear_before: BoolProperty(
+    filepath:        StringProperty(name="File Path", subtype="FILE_PATH")
+    filter_glob:     StringProperty(default="*.csv", options={"HIDDEN"})
+    clear_before:    BoolProperty(
         name="Clear Library First",
         description="Remove all existing sources before importing",
         default=False,
@@ -667,7 +744,7 @@ class HIST_OT_RefRemoveSource(Operator):
 
 
 # ---------------------------------------------------------------------------
-# Operators — Excel/CSV import into library
+# Operators — Excel / external CSV import into library
 # ---------------------------------------------------------------------------
 
 def _cell(row, key):
@@ -939,12 +1016,44 @@ class HIST_PT_LibraryPanel(Panel):
         layout = self.layout
         lib    = get_library(context)
 
-        # Sort controls
+        # --- Sort controls ---
         row = layout.row(align=True)
         row.prop(lib, "sort_order", text="Sort")
         row.operator("hist.sort_sources", text="", icon="FILE_REFRESH")
 
-        # List + side buttons
+        # --- Filter section ---
+        active = filters_active(lib)
+        filter_icon = "FILTER" if active else "FILTER"
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(lib, "show_filters",
+                 icon="TRIA_DOWN" if lib.show_filters else "TRIA_RIGHT",
+                 icon_only=True, emboss=False)
+        # Show "Filter (active)" label when filters are on
+        if active:
+            row.label(text="Filter  [active]", icon="FILTER")
+            row.operator("hist.clear_filters", text="", icon="X")
+        else:
+            row.label(text="Filter", icon="FILTER")
+
+        if lib.show_filters:
+            col = box.column(align=True)
+            col.prop(lib, "filter_title",   icon="SORTALPHA")
+            col.prop(lib, "filter_toponym", icon="WORLD")
+            col.prop(lib, "filter_date",    icon="TIME")
+            col.prop(lib, "filter_type")
+            col.prop(lib, "filter_reliability")
+            if active:
+                col.separator()
+                col.operator("hist.clear_filters", icon="X", text="Clear All Filters")
+
+        # --- Filtered count hint ---
+        if active:
+            total   = len(lib.sources)
+            visible = sum(1 for s in lib.sources if source_passes_filter(s, lib))
+            layout.label(text=f"Showing {visible} of {total} sources", icon="INFO")
+
+        # --- List + side buttons ---
         row = layout.row()
         row.template_list("HIST_UL_LibraryList", "", lib, "sources", lib, "active_index", rows=6)
         col = row.column(align=True)
@@ -1038,7 +1147,6 @@ class HIST_PT_ImportPanel(Panel):
             ("File Name",   "inventory_nr"),
             ("Link",        "url"),
             ("Description", "description"),
-            
         ]:
             col.label(text=f"  {excel_col}  ->  {addon_field}")
 
@@ -1081,6 +1189,7 @@ classes = (
     HistImportSettings,
     HIST_UL_LibraryList,
     HIST_UL_ObjectRefList,
+    HIST_OT_ClearFilters,
     HIST_OT_OpenURL,
     HIST_OT_LibAddSource,
     HIST_OT_LibRemoveSource,
