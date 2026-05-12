@@ -422,6 +422,7 @@ class HIST_OT_ClearFilters(Operator):
 
     def execute(self, context):
         lib = get_library(context)
+        lib.filter_inventory_nr = ""
         lib.filter_title       = ""
         lib.filter_toponym     = ""
         lib.filter_date        = ""
@@ -902,57 +903,57 @@ class HIST_OT_BatchExport(Operator):
     bl_label = "Batch Export glTF / GLB"
     bl_description = "Export objects as glTF/GLB with historical sources embedded as extras"
 
-def execute(self, context):
-    settings  = context.scene.hist_export_settings
-    lib       = get_library(context)
-    directory = bpy.path.abspath(settings.directory)
-    if not directory:
-        self.report({"ERROR"}, "No export directory set.")
-        return {"CANCELLED"}
-    os.makedirs(directory, exist_ok=True)
-
-    exportable_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "GPENCIL"}
-
-    # ------------------------------------------------------------------ #
-    # SELECTED — SINGLE FILE                                               #
-    # ------------------------------------------------------------------ #
-    if settings.export_scope == "SELECTED_SINGLE":
-        candidates = [
-            o for o in context.selected_objects
-            if o.type in exportable_types
-        ]
-        if settings.only_with_sources:
-            candidates = [o for o in candidates if o.hist_source_refs.refs]
-        if not candidates:
-            self.report({"WARNING"}, "No exportable objects found in selection.")
+    def execute(self, context):
+        settings  = context.scene.hist_export_settings
+        lib       = get_library(context)
+        directory = bpy.path.abspath(settings.directory)
+        if not directory:
+            self.report({"ERROR"}, "No export directory set.")
             return {"CANCELLED"}
+        os.makedirs(directory, exist_ok=True)
 
-        filepath = os.path.join(
-            directory,
-            "selection" + file_extension_for_format(settings.file_format),
-        )
-        try:
-            # Export all selected objects together
-            bpy.ops.export_scene.gltf(
-                filepath=filepath,
-                use_selection=True,
-                export_format=settings.file_format,
-                export_extras=False,
-                export_materials="EXPORT" if settings.export_textures else "NONE",
+        exportable_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "GPENCIL"}
+
+        # ------------------------------------------------------------------ #
+        # SELECTED — SINGLE FILE                                               #
+        # ------------------------------------------------------------------ #
+        if settings.export_scope == "SELECTED_SINGLE":
+            candidates = [
+                o for o in context.selected_objects
+                if o.type in exportable_types
+            ]
+            if settings.only_with_sources:
+                candidates = [o for o in candidates if o.hist_source_refs.refs]
+            if not candidates:
+                self.report({"WARNING"}, "No exportable objects found in selection.")
+                return {"CANCELLED"}
+
+            filepath = os.path.join(
+                directory,
+                "selection" + file_extension_for_format(settings.file_format),
             )
-            # Patch each object's node in the shared file
-            for obj in candidates:
-                extras_payload = sources_to_dict_for_export(obj, lib)
-                if extras_payload:
-                    inject_extras_into_file(
-                        filepath, settings.file_format, obj.name, extras_payload
-                    )
-        except Exception as e:
-            self.report({"ERROR"}, f"Export failed: {e}")
-            return {"CANCELLED"}
+            try:
+                # Export all selected objects together
+                bpy.ops.export_scene.gltf(
+                    filepath=filepath,
+                    use_selection=True,
+                    export_format=settings.file_format,
+                    export_extras=False,
+                    export_materials="EXPORT" if settings.export_textures else "NONE",
+                )
+                # Patch each object's node in the shared file
+                for obj in candidates:
+                    extras_payload = sources_to_dict_for_export(obj, lib)
+                    if extras_payload:
+                        inject_extras_into_file(
+                            filepath, settings.file_format, obj.name, extras_payload
+                        )
+            except Exception as e:
+                self.report({"ERROR"}, f"Export failed: {e}")
+                return {"CANCELLED"}
 
-        self.report({"INFO"}, f"Exported {len(candidates)} object(s) to '{filepath}'.")
-        return {"FINISHED"}
+            self.report({"INFO"}, f"Exported {len(candidates)} object(s) to '{filepath}'.")
+            return {"FINISHED"}
 
     # ------------------------------------------------------------------ #
     # ALL or SELECTED — one file per object (existing behaviour)           #
