@@ -50,8 +50,9 @@ EXPORT_FORMAT = [
 ]
 
 EXPORT_SCOPE = [
-    ("ALL",      "All Objects",      "Export every object that has sources"),
-    ("SELECTED", "Selected Objects", "Export only currently selected objects"),
+    ("ALL",             "All Objects",           "Export every object that has sources"),
+    ("SELECTED",        "Selected Objects",       "Export each selected object as a separate file"),
+    ("SELECTED_SINGLE", "Selected — Single File", "Export all selected objects into one file"),
 ]
 
 SORT_OPTIONS = [
@@ -901,68 +902,114 @@ class HIST_OT_BatchExport(Operator):
     bl_label = "Batch Export glTF / GLB"
     bl_description = "Export objects as glTF/GLB with historical sources embedded as extras"
 
-    def execute(self, context):
-        settings  = context.scene.hist_export_settings
-        lib       = get_library(context)
-        directory = bpy.path.abspath(settings.directory)
-        if not directory:
-            self.report({"ERROR"}, "No export directory set.")
-            return {"CANCELLED"}
-        os.makedirs(directory, exist_ok=True)
+def execute(self, context):
+    settings  = context.scene.hist_export_settings
+    lib       = get_library(context)
+    directory = bpy.path.abspath(settings.directory)
+    if not directory:
+        self.report({"ERROR"}, "No export directory set.")
+        return {"CANCELLED"}
+    os.makedirs(directory, exist_ok=True)
 
-        candidates = (
-            list(context.selected_objects)
-            if settings.export_scope == "SELECTED"
-            else list(context.scene.objects)
-        )
+    exportable_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "GPENCIL"}
+
+    # ------------------------------------------------------------------ #
+    # SELECTED — SINGLE FILE                                               #
+    # ------------------------------------------------------------------ #
+    if settings.export_scope == "SELECTED_SINGLE":
+        candidates = [
+            o for o in context.selected_objects
+            if o.type in exportable_types
+        ]
         if settings.only_with_sources:
             candidates = [o for o in candidates if o.hist_source_refs.refs]
-        exportable_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "GPENCIL"}
-        candidates = [o for o in candidates if o.type in exportable_types]
         if not candidates:
-            self.report({"WARNING"}, "No exportable objects found.")
+            self.report({"WARNING"}, "No exportable objects found in selection.")
             return {"CANCELLED"}
 
-        original_active    = context.view_layer.objects.active
-        original_selection = list(context.selected_objects)
-        exported, skipped  = [], []
-
-        for obj in candidates:
-            try:
-                bpy.ops.object.select_all(action="DESELECT")
-                obj.select_set(True)
-                context.view_layer.objects.active = obj
-                safe_name = bpy.path.clean_name(obj.name)
-                filepath  = os.path.join(
-                    directory,
-                    safe_name + file_extension_for_format(settings.file_format),
-                )
-                bpy.ops.export_scene.gltf(
-                    filepath=filepath,
-                    use_selection=True,
-                    export_format=settings.file_format,
-                    export_extras=False,
-                    export_materials="EXPORT" if settings.export_textures else "NONE",
-                )
+        filepath = os.path.join(
+            directory,
+            "selection" + file_extension_for_format(settings.file_format),
+        )
+        try:
+            # Export all selected objects together
+            bpy.ops.export_scene.gltf(
+                filepath=filepath,
+                use_selection=True,
+                export_format=settings.file_format,
+                export_extras=False,
+                export_materials="EXPORT" if settings.export_textures else "NONE",
+            )
+            # Patch each object's node in the shared file
+            for obj in candidates:
                 extras_payload = sources_to_dict_for_export(obj, lib)
-                inject_extras_into_file(filepath, settings.file_format, obj.name, extras_payload)
-                exported.append(obj.name)
-                self.report({"INFO"}, f"Exported: {filepath}")
-            except Exception as e:
-                skipped.append(obj.name)
-                self.report({"WARNING"}, f"Failed '{obj.name}': {e}")
+                if extras_payload:
+                    inject_extras_into_file(
+                        filepath, settings.file_format, obj.name, extras_payload
+                    )
+        except Exception as e:
+            self.report({"ERROR"}, f"Export failed: {e}")
+            return {"CANCELLED"}
 
-        bpy.ops.object.select_all(action="DESELECT")
-        for o in original_selection:
-            o.select_set(True)
-        if original_active:
-            context.view_layer.objects.active = original_active
-
-        msg = f"Exported {len(exported)} object(s) to '{directory}'"
-        if skipped:
-            msg += f" | {len(skipped)} failed: {', '.join(skipped)}"
-        self.report({"INFO"}, msg)
+        self.report({"INFO"}, f"Exported {len(candidates)} object(s) to '{filepath}'.")
         return {"FINISHED"}
+
+    # ------------------------------------------------------------------ #
+    # ALL or SELECTED — one file per object (existing behaviour)           #
+    # ------------------------------------------------------------------ #
+    candidates = (
+        list(context.selected_objects)
+        if settings.export_scope == "SELECTED"
+        else list(context.scene.objects)
+    )
+    if settings.only_with_sources:
+        candidates = [o for o in candidates if o.hist_source_refs.refs]
+    candidates = [o for o in candidates if o.type in exportable_types]
+    if not candidates:
+        self.report({"WARNING"}, "No exportable objects found.")
+        return {"CANCELLED"}
+
+    original_active    = context.view_layer.objects.active
+    original_selection = list(context.selected_objects)
+    exported, skipped  = [], []
+
+    for obj in candidates:
+        try:
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            safe_name = bpy.path.clean_name(obj.name)
+            filepath  = os.path.join(
+                directory,
+                safe_name + file_extension_for_format(settings.file_format),
+            )
+            bpy.ops.export_scene.gltf(
+                filepath=filepath,
+                use_selection=True,
+                export_format=settings.file_format,
+                export_extras=False,
+                export_materials="EXPORT" if settings.export_textures else "NONE",
+            )
+            extras_payload = sources_to_dict_for_export(obj, lib)
+            inject_extras_into_file(
+                filepath, settings.file_format, obj.name, extras_payload
+            )
+            exported.append(obj.name)
+        except Exception as e:
+            skipped.append(obj.name)
+            self.report({"WARNING"}, f"Failed '{obj.name}': {e}")
+
+    bpy.ops.object.select_all(action="DESELECT")
+    for o in original_selection:
+        o.select_set(True)
+    if original_active:
+        context.view_layer.objects.active = original_active
+
+    msg = f"Exported {len(exported)} object(s) to '{directory}'"
+    if skipped:
+        msg += f" | {len(skipped)} failed: {', '.join(skipped)}"
+    self.report({"INFO"}, msg)
+    return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
