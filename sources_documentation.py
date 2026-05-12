@@ -955,62 +955,62 @@ class HIST_OT_BatchExport(Operator):
             self.report({"INFO"}, f"Exported {len(candidates)} object(s) to '{filepath}'.")
             return {"FINISHED"}
 
-    # ------------------------------------------------------------------ #
-    # ALL or SELECTED — one file per object (existing behaviour)           #
-    # ------------------------------------------------------------------ #
-    candidates = (
-        list(context.selected_objects)
-        if settings.export_scope == "SELECTED"
-        else list(context.scene.objects)
-    )
-    if settings.only_with_sources:
-        candidates = [o for o in candidates if o.hist_source_refs.refs]
-    candidates = [o for o in candidates if o.type in exportable_types]
-    if not candidates:
-        self.report({"WARNING"}, "No exportable objects found.")
-        return {"CANCELLED"}
+        # ------------------------------------------------------------------ #
+        # ALL or SELECTED — one file per object (existing behaviour)           #
+        # ------------------------------------------------------------------ #
+        candidates = (
+            list(context.selected_objects)
+            if settings.export_scope == "SELECTED"
+            else list(context.scene.objects)
+        )
+        if settings.only_with_sources:
+            candidates = [o for o in candidates if o.hist_source_refs.refs]
+        candidates = [o for o in candidates if o.type in exportable_types]
+        if not candidates:
+            self.report({"WARNING"}, "No exportable objects found.")
+            return {"CANCELLED"}
 
-    original_active    = context.view_layer.objects.active
-    original_selection = list(context.selected_objects)
-    exported, skipped  = [], []
+        original_active    = context.view_layer.objects.active
+        original_selection = list(context.selected_objects)
+        exported, skipped  = [], []
 
-    for obj in candidates:
-        try:
-            bpy.ops.object.select_all(action="DESELECT")
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-            safe_name = bpy.path.clean_name(obj.name)
-            filepath  = os.path.join(
-                directory,
-                safe_name + file_extension_for_format(settings.file_format),
-            )
-            bpy.ops.export_scene.gltf(
-                filepath=filepath,
-                use_selection=True,
-                export_format=settings.file_format,
-                export_extras=False,
-                export_materials="EXPORT" if settings.export_textures else "NONE",
-            )
-            extras_payload = sources_to_dict_for_export(obj, lib)
-            inject_extras_into_file(
-                filepath, settings.file_format, obj.name, extras_payload
-            )
-            exported.append(obj.name)
-        except Exception as e:
-            skipped.append(obj.name)
-            self.report({"WARNING"}, f"Failed '{obj.name}': {e}")
+        for obj in candidates:
+            try:
+                bpy.ops.object.select_all(action="DESELECT")
+                obj.select_set(True)
+                context.view_layer.objects.active = obj
+                safe_name = bpy.path.clean_name(obj.name)
+                filepath  = os.path.join(
+                    directory,
+                    safe_name + file_extension_for_format(settings.file_format),
+                )
+                bpy.ops.export_scene.gltf(
+                    filepath=filepath,
+                    use_selection=True,
+                    export_format=settings.file_format,
+                    export_extras=False,
+                    export_materials="EXPORT" if settings.export_textures else "NONE",
+                )
+                extras_payload = sources_to_dict_for_export(obj, lib)
+                inject_extras_into_file(
+                    filepath, settings.file_format, obj.name, extras_payload
+                )
+                exported.append(obj.name)
+            except Exception as e:
+                skipped.append(obj.name)
+                self.report({"WARNING"}, f"Failed '{obj.name}': {e}")
 
-    bpy.ops.object.select_all(action="DESELECT")
-    for o in original_selection:
-        o.select_set(True)
-    if original_active:
-        context.view_layer.objects.active = original_active
+        bpy.ops.object.select_all(action="DESELECT")
+        for o in original_selection:
+            o.select_set(True)
+        if original_active:
+            context.view_layer.objects.active = original_active
 
-    msg = f"Exported {len(exported)} object(s) to '{directory}'"
-    if skipped:
-        msg += f" | {len(skipped)} failed: {', '.join(skipped)}"
-    self.report({"INFO"}, msg)
-    return {"FINISHED"}
+        msg = f"Exported {len(exported)} object(s) to '{directory}'"
+        if skipped:
+            msg += f" | {len(skipped)} failed: {', '.join(skipped)}"
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
