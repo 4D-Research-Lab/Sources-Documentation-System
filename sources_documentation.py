@@ -358,7 +358,7 @@ class ObjectSourceRefs(PropertyGroup):
     active_index: IntProperty(name="Active Ref Index", default=0)
 
 class HistExportSettings(PropertyGroup):
-    directory:         StringProperty(name="Export Directory", default="//exports/", subtype="DIR_PATH")
+    directory:         StringProperty(name="Export Directory", default="//exports/")
     file_format:       EnumProperty(name="Format", items=EXPORT_FORMAT, default="GLB")
     export_scope:      EnumProperty(name="Scope",  items=EXPORT_SCOPE,  default="ALL")
     only_with_sources: BoolProperty(name="Only Objects with Sources", default=True)
@@ -832,6 +832,25 @@ class HIST_OT_ImportSources(Operator):
 # Operators — glTF batch export + text report
 # ---------------------------------------------------------------------------
 
+class HIST_OT_BrowseExportDir(Operator):
+    bl_idname      = "hist.browse_export_dir"
+    bl_label       = "Browse"
+    bl_description = "Browse for export directory"
+
+    directory:   StringProperty(subtype="DIR_PATH")
+    filter_glob: StringProperty(default="", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        self.directory = bpy.path.abspath(
+            context.scene.hist_export_settings.directory
+        )
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        context.scene.hist_export_settings.directory = self.directory
+        return {"FINISHED"}
+    
 class HIST_OT_ExportReport(Operator):
     bl_idname      = "hist.export_report"
     bl_label       = "Export Source Report"
@@ -1182,7 +1201,9 @@ class HIST_PT_ExportPanel(Panel):
     def draw(self, context):
         layout = self.layout
         s      = context.scene.hist_export_settings
-        layout.prop(s, "directory")
+        row = layout.row(align=True)
+        row.prop(s, "directory", text="Directory")
+        row.operator("hist.browse_export_dir", text="", icon="FILE_FOLDER")
         layout.row(align=True).prop(s, "file_format",  expand=True)
         layout.row(align=True).prop(s, "export_scope", expand=True)
         col = layout.column(align=True)
@@ -1191,7 +1212,7 @@ class HIST_PT_ExportPanel(Panel):
         col.prop(s, "apply_modifiers")
         layout.separator()
         box = layout.box()
-        box.label(text="Extras included in export:", icon="INFO")
+        box.label(text="All custom properties are exported as GLB/GLTF extras. This includes:", icon="INFO")
         col = box.column(align=True)
         col.scale_y = 0.8
         col.label(text="  historical_sources  (this addon)")
@@ -1232,6 +1253,7 @@ classes = (
     HIST_PT_ObjectPanel,
     HIST_PT_ImportPanel,
     HIST_PT_ExportPanel,
+    HIST_OT_BrowseExportDir,
 )
 
 def register():
