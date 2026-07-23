@@ -245,32 +245,65 @@ def sources_to_dict_for_export(obj, library):
 
 def build_extras_for_object(obj, library):
     """
-    Combine historical sources + Uncertainty Index data into one extras dict.
-    Stored as a single '_hist_extras' custom property so Blender 4.x glTF
-    exporter picks it up automatically via export_extras=True.
+    Return a flat dict of all extras to embed on this object.
+    Keys become direct children of node.extras in the exported glTF/GLB,
+    so the viewer can read them as mesh.metadata.gltf.extras.historical_sources
+    without any extra parsing step.
     """
     extras = {}
+
     sources = sources_to_dict_for_export(obj, library)
     if sources:
-        extras[EXTRAS_KEY] = sources
+        extras[EXTRAS_KEY] = sources          # list — exported as a JSON array
+
     uncertainty_index = obj.get("uncertainty_index")
     uncertainty_label = obj.get("uncertainty_label")
     if uncertainty_index is not None:
         extras["uncertainty_index"] = uncertainty_index
     if uncertainty_label is not None:
         extras["uncertainty_label"] = uncertainty_label
+
     return extras
 
 def write_extras_to_object(obj, extras):
-    if extras:
-        obj["_hist_extras"] = json.dumps(extras)
-    elif "_hist_extras" in obj:
-        del obj["_hist_extras"]
+    """
+    Write each extras key as its own custom property on the Blender object.
 
-def clear_extras_from_object(obj):
+    Blender 4.x glTF exporter (export_extras=True) serialises every custom
+    property that is NOT prefixed with '_' directly into node.extras.
+    Writing one property per key — instead of one big JSON-encoded string —
+    means the viewer receives:
+
+        node.extras.historical_sources = [...]      ← proper array
+        node.extras.uncertainty_index  = 3          ← proper number
+
+    rather than:
+
+        node.extras._hist_extras = '{"historical_sources": [...]}'  ← broken
+    """
+    # Clean up any leftover keys from the old single-property approach
     if "_hist_extras" in obj:
         del obj["_hist_extras"]
 
+    for key, value in extras.items():
+        if isinstance(value, (dict, list)):
+            # Custom properties don't support nested objects natively;
+            # store as JSON string under a key WITHOUT a leading underscore
+            # so the exporter still picks it up, then parse in the viewer.
+            # For lists of dicts (historical_sources) this is necessary.
+            obj[key] = json.dumps(value, ensure_ascii=False)
+        else:
+            obj[key] = value
+
+ef clear_extras_from_object(obj):
+    """Remove all extras custom properties written by write_extras_to_object."""
+    # Remove new-style per-key properties
+    for key in [EXTRAS_KEY, "uncertainty_index", "uncertainty_label"]:
+        if key in obj:
+            del obj[key]
+    # Also remove old-style property if present (migration safety)
+    if "_hist_extras" in obj:
+        del obj["_hist_extras"]
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
