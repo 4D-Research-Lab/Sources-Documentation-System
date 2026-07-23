@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Historical Source Documentation",
     "author": "Tijm Lanjouw/Claude Sonnet 4.6",
-    "version": (2, 0, 0),
+    "version": (2, 1, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Hist. Sources",
     "description": "Document historical sources for architectural reconstruction",
@@ -16,6 +16,7 @@ import json
 import uuid
 import csv
 import math
+import struct
 import webbrowser
 from bpy.types import PropertyGroup, Panel, Operator, UIList
 from bpy.props import (
@@ -245,65 +246,124 @@ def sources_to_dict_for_export(obj, library):
 
 def build_extras_for_object(obj, library):
     """
-    Return a flat dict of all extras to embed on this object.
-    Keys become direct children of node.extras in the exported glTF/GLB,
-    so the viewer can read them as mesh.metadata.gltf.extras.historical_sources
-    without any extra parsing step.
+    Return a dict of all extras to inject into node.extras for this object.
+    historical_sources will become a real JSON array in the GLB — not a string.
     """
     extras = {}
-
     sources = sources_to_dict_for_export(obj, library)
     if sources:
-        extras[EXTRAS_KEY] = sources          # list — exported as a JSON array
-
+        extras[EXTRAS_KEY] = sources
     uncertainty_index = obj.get("uncertainty_index")
     uncertainty_label = obj.get("uncertainty_label")
     if uncertainty_index is not None:
         extras["uncertainty_index"] = uncertainty_index
     if uncertainty_label is not None:
         extras["uncertainty_label"] = uncertainty_label
-
     return extras
 
-def write_extras_to_object(obj, extras):
+# ---------------------------------------------------------------------------
+# GLB binary injection
+# ---------------------------------------------------------------------------
+#
+# GLB format (little-endian):
+#   12 bytes  — file header  (magic, version, total length)
+#   8  bytes  — chunk 0 header (chunk length, chunk type 0x4E4F534A = "JSON")
+#   N  bytes  — chunk 0 data  (JSON, padded to 4-byte boundary with 0x20)
+#   8  bytes  — chunk 1 header (chunk length, chunk type 0x004E4942 = "BIN\0")  [optional]
+#   M  bytes  — chunk 1 data
+#
+# We only touch the JSON chunk. We:
+#   1. Parse it
+#   2. Find each node by name and inject extras
+#   3. Re-serialise, re-pad, update chunk length and file length
+# ---------------------------------------------------------------------------
+
+GLB_MAGIC        = 0x46546C67   # "glTF"
+GLB_VERSION      = 2
+CHUNK_TYPE_JSON  = 0x4E4F534A   # "JSON"
+CHUNK_TYPE_BIN   = 0x004E4942   # "BIN\0"
+
+
+def _read_glb(filepath):
+    """Read a GLB file and return (header_bytes, gltf_dict, bin_chunk_bytes_or_None)."""
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    magic, version, total_length = struct.unpack_from("<III", data, 0)
+    if magic != GLB_MAGIC or version != GLB_VERSION:
+        raise ValueError(f"Not a valid GLB v2 file: {filepath}")
+
+    offset = 12  # past file header
+
+    # Chunk 0 — must be JSON
+    chunk0_len, chunk0_type = struct.unpack_from("<II", data, offset)
+    if chunk0_type != CHUNK_TYPE_JSON:
+        raise ValueError("GLB chunk 0 is not JSON")
+    json_bytes = data[offset + 8 : offset + 8 + chunk0_len]
+    gltf = json.loads(json_bytes.decode("utf-8"))
+
+    offset += 8 + chunk0_len
+
+    # Chunk 1 — optional BIN
+    bin_bytes = None
+    if offset < total_length:
+        chunk1_len, chunk1_type = struct.unpack_from("<II", data, offset)
+        if chunk1_type == CHUNK_TYPE_BIN:
+            bin_bytes = data[offset : offset + 8 + chunk1_len]  # keep header + data
+
+    return gltf, bin_bytes
+
+
+def _write_glb(filepath, gltf, bin_chunk_bytes):
+    """Serialise gltf dict back to GLB, preserving the BIN chunk if present."""
+    json_str   = json.dumps(gltf, ensure_ascii=False, separators=(",", ":"))
+    json_bytes = json_str.encode("utf-8")
+
+    # Pad JSON to 4-byte boundary with spaces (0x20) as per spec
+    pad = (4 - len(json_bytes) % 4) % 4
+    json_bytes += b" " * pad
+
+    chunk0  = struct.pack("<II", len(json_bytes), CHUNK_TYPE_JSON) + json_bytes
+    payload = chunk0 + (bin_chunk_bytes or b"")
+
+    total_length = 12 + len(payload)
+    header = struct.pack("<III", GLB_MAGIC, GLB_VERSION, total_length)
+
+    with open(filepath, "wb") as f:
+        f.write(header + payload)
+
+
+def inject_extras_into_glb(filepath, extras_by_name):
     """
-    Write each extras key as its own custom property on the Blender object.
+    Open a GLB file and inject extras into nodes by name.
 
-    Blender 4.x glTF exporter (export_extras=True) serialises every custom
-    property that is NOT prefixed with '_' directly into node.extras.
-    Writing one property per key — instead of one big JSON-encoded string —
-    means the viewer receives:
+    extras_by_name: dict of { blender_object_name: extras_dict }
 
-        node.extras.historical_sources = [...]      ← proper array
-        node.extras.uncertainty_index  = 3          ← proper number
-
-    rather than:
-
-        node.extras._hist_extras = '{"historical_sources": [...]}'  ← broken
+    Each extras_dict is merged into the matching node's "extras" object.
+    historical_sources ends up as a real JSON array, not a string.
     """
-    # Clean up any leftover keys from the old single-property approach
-    if "_hist_extras" in obj:
-        del obj["_hist_extras"]
+    if not extras_by_name:
+        return 0
 
-    for key, value in extras.items():
-        if isinstance(value, (dict, list)):
-            # Custom properties don't support nested objects natively;
-            # store as JSON string under a key WITHOUT a leading underscore
-            # so the exporter still picks it up, then parse in the viewer.
-            # For lists of dicts (historical_sources) this is necessary.
-            obj[key] = json.dumps(value, ensure_ascii=False)
-        else:
-            obj[key] = value
+    gltf, bin_bytes = _read_glb(filepath)
 
-ef clear_extras_from_object(obj):
-    """Remove all extras custom properties written by write_extras_to_object."""
-    # Remove new-style per-key properties
-    for key in [EXTRAS_KEY, "uncertainty_index", "uncertainty_label"]:
-        if key in obj:
-            del obj[key]
-    # Also remove old-style property if present (migration safety)
-    if "_hist_extras" in obj:
-        del obj["_hist_extras"]
+    nodes    = gltf.get("nodes", [])
+    injected = 0
+
+    for node in nodes:
+        name = node.get("name", "")
+        if name in extras_by_name:
+            if "extras" not in node:
+                node["extras"] = {}
+            node["extras"].update(extras_by_name[name])
+            injected += 1
+
+    if injected:
+        _write_glb(filepath, gltf, bin_bytes)
+
+    return injected
+
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -362,11 +422,10 @@ class HistExportSettings(PropertyGroup):
     export_collections:  BoolProperty(name="Full Collection Hierarchy",
                              description="Export collections as empty nodes to preserve hierarchy",
                              default=True)
-    export_filename: StringProperty(
-    name="File Name",
-    description="File name for single-file export (without extension)",
-    default="export")
-    
+    export_filename:     StringProperty(
+                             name="File Name",
+                             description="File name for single-file export (without extension)",
+                             default="export")
 
 class HistImportSettings(PropertyGroup):
     filepath: StringProperty(name="File",
@@ -873,28 +932,55 @@ class HIST_OT_ExportReport(Operator):
         self.report({"INFO"}, f"Report written to Text Editor: '{name}'")
         return {"FINISHED"}
 
+
 class HIST_OT_BatchExport(Operator):
     bl_idname      = "hist.batch_export"
     bl_label       = "Batch Export glTF / GLB"
     bl_description = (
-        "Export objects as glTF/GLB. All custom properties (including historical "
-        "sources and uncertainty classifications) are embedded as extras."
+        "Export objects as glTF/GLB with historical sources injected as real "
+        "JSON arrays in node.extras (binary injection, no string encoding)."
     )
 
-    def _prepare_extras(self, context, candidates):
-        """Write extras as '_hist_extras' custom property before export, return written list."""
-        lib     = get_library(context)
-        written = []
-        for obj in candidates:
-            extras = build_extras_for_object(obj, lib)
-            if extras:
-                write_extras_to_object(obj, extras)
-                written.append(obj)
-        return written
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-    def _cleanup_extras(self, written):
-        for obj in written:
-            clear_extras_from_object(obj)
+    def _do_gltf_export(self, filepath, settings, use_selection):
+        """Run the Blender glTF exporter. No extras — we inject them ourselves."""
+        bpy.ops.export_scene.gltf(
+            filepath=filepath,
+            use_selection=use_selection,
+            export_format=settings.file_format,
+            export_extras=False,            # we handle extras via binary injection
+            export_apply=settings.apply_modifiers,
+            export_hierarchy_full_collections=settings.export_collections,
+            export_materials="EXPORT" if settings.export_textures else "NONE",
+        )
+
+    def _inject(self, filepath, candidates, library):
+        """
+        Build extras for each candidate and inject into the GLB.
+        Only works for GLB format; GLTF_SEPARATE / GLTF_EMBEDDED fall back
+        to export_extras=True with JSON-string values (acceptable trade-off).
+        """
+        extras_by_name = {}
+        for obj in candidates:
+            extras = build_extras_for_object(obj, library)
+            if extras:
+                extras_by_name[obj.name] = extras
+
+        if not extras_by_name:
+            return 0
+
+        try:
+            return inject_extras_into_glb(filepath, extras_by_name)
+        except Exception as e:
+            self.report({"WARNING"}, f"GLB injection failed for '{filepath}': {e}")
+            return 0
+
+    # ------------------------------------------------------------------
+    # execute
+    # ------------------------------------------------------------------
 
     def execute(self, context):
         settings  = context.scene.hist_export_settings
@@ -904,7 +990,9 @@ class HIST_OT_BatchExport(Operator):
             return {"CANCELLED"}
         os.makedirs(directory, exist_ok=True)
 
+        lib              = get_library(context)
         exportable_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "GREASEPENCIL"}
+        is_glb           = settings.file_format == "GLB"
 
         # ------------------------------------------------------------------ #
         # SELECTED — SINGLE FILE                                               #
@@ -914,27 +1002,27 @@ class HIST_OT_BatchExport(Operator):
             if not candidates:
                 self.report({"WARNING"}, "No exportable objects found in selection.")
                 return {"CANCELLED"}
+
             filename = settings.export_filename.strip() or "export"
             filepath = os.path.join(
                 directory, filename + file_extension_for_format(settings.file_format)
             )
-            written = self._prepare_extras(context, candidates)
+
             try:
-                bpy.ops.export_scene.gltf(
-                    filepath=filepath,
-                    use_selection=True,
-                    export_format=settings.file_format,
-                    export_extras=True,
-                    export_apply=settings.apply_modifiers,
-                    export_hierarchy_full_collections=settings.export_collections,
-                    export_materials="EXPORT" if settings.export_textures else "NONE",
-                )
+                self._do_gltf_export(filepath, settings, use_selection=True)
             except Exception as e:
-                self._cleanup_extras(written)
                 self.report({"ERROR"}, f"Export failed: {e}")
                 return {"CANCELLED"}
-            self._cleanup_extras(written)
-            self.report({"INFO"}, f"Exported {len(candidates)} object(s) to '{filepath}'.")
+
+            if is_glb:
+                n = self._inject(filepath, candidates, lib)
+                self.report({"INFO"},
+                    f"Exported {len(candidates)} object(s) to '{filepath}' "
+                    f"({n} node(s) with injected extras).")
+            else:
+                self.report({"INFO"},
+                    f"Exported {len(candidates)} object(s) to '{filepath}' "
+                    f"(GLTF format — extras not injected).")
             return {"FINISHED"}
 
         # ------------------------------------------------------------------ #
@@ -954,30 +1042,24 @@ class HIST_OT_BatchExport(Operator):
         exported, skipped  = [], []
 
         for obj in candidates:
-            written = self._prepare_extras(context, [obj])
+            filepath = os.path.join(
+                directory,
+                bpy.path.clean_name(obj.name) + file_extension_for_format(settings.file_format),
+            )
             try:
                 bpy.ops.object.select_all(action="DESELECT")
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
-                filepath = os.path.join(
-                    directory,
-                    bpy.path.clean_name(obj.name) + file_extension_for_format(settings.file_format),
-                )
-                bpy.ops.export_scene.gltf(
-                    filepath=filepath,
-                    use_selection=True,
-                    export_format=settings.file_format,
-                    export_extras=True,
-                    export_apply=settings.apply_modifiers,
-                    export_hierarchy_full_collections=settings.export_collections,
-                    export_materials="EXPORT" if settings.export_textures else "NONE",
-                )
+
+                self._do_gltf_export(filepath, settings, use_selection=True)
+
+                if is_glb:
+                    self._inject(filepath, [obj], lib)
+
                 exported.append(obj.name)
             except Exception as e:
                 skipped.append(obj.name)
                 self.report({"WARNING"}, f"Failed '{obj.name}': {e}")
-            finally:
-                self._cleanup_extras(written)
 
         bpy.ops.object.select_all(action="DESELECT")
         for o in original_selection:
@@ -1186,7 +1268,10 @@ class HIST_PT_ExportPanel(Panel):
         col.prop(s, "apply_modifiers")
         col.prop(s, "export_collections")
         layout.separator()
-        layout.label(text="All custom properties exported as extras", icon="INFO")
+        if s.file_format == "GLB":
+            layout.label(text="Extras injected as real JSON arrays", icon="INFO")
+        else:
+            layout.label(text="GLTF format: extras not injected", icon="INFO")
         layout.separator()
         layout.operator("hist.batch_export",  icon="EXPORT", text="Batch Export")
         layout.operator("hist.export_report", icon="TEXT")
