@@ -3,8 +3,8 @@
 bl_info = {
     "name": "Historical Source Documentation",
     "author": "Tijm Lanjouw/Claude Sonnet 4.6",
-    "version": (1, 0, 0),
-    "blender": (3, 6, 0),
+    "version": (2, 0, 0),
+    "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Hist. Sources",
     "description": "Document historical sources for architectural reconstruction",
     "category": "Object",
@@ -14,7 +14,6 @@ import bpy
 import os
 import json
 import uuid
-import struct
 import csv
 import math
 import webbrowser
@@ -83,6 +82,7 @@ RELIABILITY_ICONS = {
     "LOW":    "KEYTYPE_JITTER_VEC",
 }
 
+# Key used for historical sources in glTF extras
 EXTRAS_KEY = "historical_sources"
 
 CSV_HEADER = [
@@ -144,26 +144,6 @@ def resolve_object_sources(obj, library):
 def is_url(value):
     return value.startswith("http://") or value.startswith("https://")
 
-def sources_to_dict_for_export(obj, library):
-    result = []
-    for ref, src in resolve_object_sources(obj, library):
-        entry = {"source_id": ref.source_id, "part_note": ref.part_note}
-        if src:
-            entry.update({
-                "title":        src.title,
-                "source_type":  src.source_type,
-                "date":         src.date,
-                "toponym":      src.toponym,
-                "repository":   src.repository,
-                "inventory_nr": src.inventory_nr,
-                "url":          src.url,
-                "reliability":  src.reliability,
-                "description":  src.description,
-                "notes":        src.notes,
-            })
-        result.append(entry)
-    return result
-
 def file_extension_for_format(fmt):
     return ".glb" if fmt == "GLB" else ".gltf"
 
@@ -212,7 +192,7 @@ def _copy_source_fields(src, sid, title, stype, date, topo, repo, inv, url, rel,
     src.notes        = notes
 
 # ---------------------------------------------------------------------------
-# Shared helper: import rows into library (deduplicates skip logic)
+# Shared helper: import rows into library
 # ---------------------------------------------------------------------------
 
 def _import_rows_into_library(lib, rows, skip_duplicates):
@@ -250,50 +230,67 @@ def _import_rows_into_library(lib, rows, skip_duplicates):
     return added, skipped
 
 # ---------------------------------------------------------------------------
-# Post-export extras injection
+# Extras helpers
 # ---------------------------------------------------------------------------
 
-def _patch_gltf_json(gltf_data, obj_name, extras_payload):
-    for node in gltf_data.get("nodes", []):
-        if node.get("name") == obj_name:
-            node.setdefault("extras", {})[EXTRAS_KEY] = extras_payload
-    return gltf_data
+def sources_to_dict_for_export(obj, library):
+    """Build the historical_sources list for glTF extras."""
+    result = []
+    for ref, src in resolve_object_sources(obj, library):
+        entry = {"source_id": ref.source_id, "part_note": ref.part_note}
+        if src:
+            entry.update({
+                "title":        src.title,
+                "source_type":  src.source_type,
+                "date":         src.date,
+                "toponym":      src.toponym,
+                "repository":   src.repository,
+                "inventory_nr": src.inventory_nr,
+                "url":          src.url,
+                "reliability":  src.reliability,
+                "description":  src.description,
+                "notes":        src.notes,
+            })
+        result.append(entry)
+    return result
 
-def inject_extras_into_gltf(filepath, obj_name, extras_payload):
-    with open(filepath, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data = _patch_gltf_json(data, obj_name, extras_payload)
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def build_extras_for_object(obj, library):
+    """
+    Build the full extras dict for an object, combining historical sources
+    and uncertainty classification (from the Uncertainty Index addon, if present).
+    In Blender 4.x this dict is written as a single custom property so the
+    built-in glTF exporter picks it up automatically via export_extras=True.
+    """
+    extras = {}
 
-def inject_extras_into_glb(filepath, obj_name, extras_payload):
-    with open(filepath, "rb") as f:
-        raw = f.read()
-    magic, version, total_len = struct.unpack_from("<III", raw, 0)
-    if magic != 0x46546C67:
-        raise ValueError(f"Not a valid GLB file: {filepath}")
-    json_chunk_len  = struct.unpack_from("<I", raw, 12)[0]
-    json_chunk_type = struct.unpack_from("<I", raw, 16)[0]
-    if json_chunk_type != 0x4E4F534A:
-        raise ValueError("First GLB chunk is not JSON.")
-    json_bytes     = raw[20 : 20 + json_chunk_len]
-    gltf_data      = json.loads(json_bytes.decode("utf-8"))
-    gltf_data      = _patch_gltf_json(gltf_data, obj_name, extras_payload)
-    new_json_bytes = json.dumps(gltf_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    pad            = (4 - len(new_json_bytes) % 4) % 4
-    new_json_bytes += b" " * pad
-    rest           = raw[20 + json_chunk_len:]
-    new_json_chunk = struct.pack("<II", len(new_json_bytes), 0x4E4F534A) + new_json_bytes
-    new_total      = 12 + len(new_json_chunk) + len(rest)
-    new_header     = struct.pack("<III", magic, version, new_total)
-    with open(filepath, "wb") as f:
-        f.write(new_header + new_json_chunk + rest)
+    sources = sources_to_dict_for_export(obj, library)
+    if sources:
+        extras[EXTRAS_KEY] = sources
 
-def inject_extras_into_file(filepath, fmt, obj_name, extras_payload):
-    if fmt == "GLB":
-        inject_extras_into_glb(filepath, obj_name, extras_payload)
-    else:
-        inject_extras_into_gltf(filepath, obj_name, extras_payload)
+    # Uncertainty Index addon stores these as plain custom properties
+    uncertainty_index = obj.get("uncertainty_index")
+    uncertainty_label = obj.get("uncertainty_label")
+    if uncertainty_index is not None:
+        extras["uncertainty_index"] = uncertainty_index
+    if uncertainty_label is not None:
+        extras["uncertainty_label"] = uncertainty_label
+
+    return extras
+
+def write_extras_to_object(obj, extras):
+    """
+    Write the extras dict as a JSON custom property on the object so Blender 4.x
+    glTF exporter picks it up when export_extras=True.
+    We store the payload under a single key to avoid polluting the namespace.
+    """
+    if extras:
+        obj["_hist_extras"] = json.dumps(extras)
+    elif "_hist_extras" in obj:
+        del obj["_hist_extras"]
+
+def clear_extras_from_object(obj):
+    if "_hist_extras" in obj:
+        del obj["_hist_extras"]
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -318,26 +315,43 @@ FILTER_REL_ITEMS  = [("ALL", "All",       "")] + list(RELIABILITY)
 class HistoricalSourceLibrary(PropertyGroup):
     sources:             CollectionProperty(type=HistoricalSource)
     active_index:        IntProperty(name="Active Library Index", default=0)
-    sort_order:          EnumProperty(name="Sort By", items=SORT_OPTIONS, default="NONE",
-                             description="Sort the source library list")
-    filter_inventory_nr: StringProperty(name="Inventory No.", default="",
-                             description="Filter by inventory number (substring, case-insensitive)")
-    filter_title:        StringProperty(name="Title",    default="",
-                             description="Filter by title (substring, case-insensitive)")
-    filter_toponym:      StringProperty(name="Toponym",  default="",
-                             description="Filter by toponym (substring, case-insensitive)")
-    filter_date:         StringProperty(name="Date",     default="",
-                             description="Filter by date string (substring, case-insensitive)")
-    filter_type:         EnumProperty(  name="Type",        items=FILTER_TYPE_ITEMS, default="ALL",
-                             description="Filter by source type")
-    filter_reliability:  EnumProperty(  name="Reliability", items=FILTER_REL_ITEMS,  default="ALL",
-                             description="Filter by reliability")
-    show_filters:        BoolProperty(  name="Show Filters", default=False)
+    sort_order:          EnumProperty(
+        name="Sort By", items=SORT_OPTIONS, default="NONE",
+        description="Sort the source library list"
+    )
+    filter_inventory_nr: StringProperty(
+        name="Inventory No.", default="",
+        description="Filter by inventory number (substring, case-insensitive)"
+    )
+    filter_title:        StringProperty(
+        name="Title", default="",
+        description="Filter by title (substring, case-insensitive)"
+    )
+    filter_toponym:      StringProperty(
+        name="Toponym", default="",
+        description="Filter by toponym (substring, case-insensitive)"
+    )
+    filter_date:         StringProperty(
+        name="Date", default="",
+        description="Filter by date string (substring, case-insensitive)"
+    )
+    filter_type:         EnumProperty(
+        name="Type", items=FILTER_TYPE_ITEMS, default="ALL",
+        description="Filter by source type"
+    )
+    filter_reliability:  EnumProperty(
+        name="Reliability", items=FILTER_REL_ITEMS, default="ALL",
+        description="Filter by reliability"
+    )
+    show_filters:        BoolProperty(name="Show Filters", default=False)
 
 class ObjectSourceRef(PropertyGroup):
     source_id: StringProperty(name="Source ID", default="")
-    part_note: StringProperty(name="Part Note",
-        description="Which part of this object the source applies to", default="")
+    part_note: StringProperty(
+        name="Part Note",
+        description="Which part of this object the source applies to",
+        default="",
+    )
 
 class ObjectSourceRefs(PropertyGroup):
     refs:         CollectionProperty(type=ObjectSourceRef)
@@ -349,16 +363,30 @@ class HistExportSettings(PropertyGroup):
     export_scope:      EnumProperty(name="Scope",  items=EXPORT_SCOPE,  default="ALL")
     only_with_sources: BoolProperty(name="Only Objects with Sources", default=True)
     export_textures:   BoolProperty(name="Include Textures",          default=True)
+    apply_modifiers:   BoolProperty(
+        name="Apply Modifiers",
+        description="Apply modifiers to exported meshes",
+        default=False,
+    )
 
 class HistImportSettings(PropertyGroup):
-    filepath: StringProperty(name="File",
+    filepath: StringProperty(
+        name="File",
         description="Path to an Excel (.xlsx) or CSV (.csv) file containing sources",
-        default="", subtype="FILE_PATH")
-    skip_duplicates: BoolProperty(name="Skip Duplicate Titles",
-        description="Skip rows whose Title already exists in the library", default=True)
-    default_reliability: EnumProperty(name="Default Reliability",
+        default="",
+        subtype="FILE_PATH",
+    )
+    skip_duplicates: BoolProperty(
+        name="Skip Duplicate Titles",
+        description="Skip rows whose Title already exists in the library",
+        default=True,
+    )
+    default_reliability: EnumProperty(
+        name="Default Reliability",
         description="Reliability assigned to all imported sources",
-        items=RELIABILITY, default="MEDIUM")
+        items=RELIABILITY,
+        default="MEDIUM",
+    )
 
 # ---------------------------------------------------------------------------
 # UI Lists
@@ -413,8 +441,10 @@ class HIST_UL_ObjectRefList(UIList):
                 row.label(text=f"[missing] {item.source_id[:8]}...", icon="ERROR")
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
-            layout.label(text="",
-                icon=SOURCE_TYPE_ICONS.get(src.source_type, "QUESTION") if src else "ERROR")
+            layout.label(
+                text="",
+                icon=SOURCE_TYPE_ICONS.get(src.source_type, "QUESTION") if src else "ERROR",
+            )
 
 # ---------------------------------------------------------------------------
 # Operators — filter clear
@@ -551,9 +581,11 @@ class HIST_OT_SortSources(Operator):
             return {"FINISHED"}
 
         items = [
-            (src.source_id, src.title, src.source_type, src.date,
-             src.toponym, src.repository, src.inventory_nr, src.url,
-             src.reliability, src.description, src.notes)
+            (
+                src.source_id, src.title, src.source_type, src.date,
+                src.toponym, src.repository, src.inventory_nr, src.url,
+                src.reliability, src.description, src.notes,
+            )
             for src in lib.sources
         ]
 
@@ -625,10 +657,16 @@ class HIST_OT_LibraryImportCSV(Operator):
 
     filepath:        StringProperty(name="File Path", subtype="FILE_PATH")
     filter_glob:     StringProperty(default="*.csv", options={"HIDDEN"})
-    clear_before:    BoolProperty(name="Clear Library First",
-                         description="Remove all existing sources before importing", default=False)
-    skip_duplicates: BoolProperty(name="Skip Duplicate Titles",
-                         description="Skip rows whose Title already exists in the library", default=True)
+    clear_before:    BoolProperty(
+        name="Clear Library First",
+        description="Remove all existing sources before importing",
+        default=False,
+    )
+    skip_duplicates: BoolProperty(
+        name="Skip Duplicate Titles",
+        description="Skip rows whose Title already exists in the library",
+        default=True,
+    )
 
     def execute(self, context):
         lib  = get_library(context)
@@ -667,8 +705,10 @@ class HIST_OT_LibraryImportCSV(Operator):
 class HIST_OT_LinkToSelected(Operator):
     bl_idname      = "hist.link_to_selected"
     bl_label       = "Link to Selected Objects"
-    bl_description = ("Link the active library source to all selected objects. "
-                      "Objects that already have this source linked are skipped.")
+    bl_description = (
+        "Link the active library source to all selected objects. "
+        "Objects that already have this source linked are skipped."
+    )
 
     def execute(self, context):
         lib = get_library(context)
@@ -676,8 +716,10 @@ class HIST_OT_LinkToSelected(Operator):
             self.report({"WARNING"}, "No sources in library.")
             return {"CANCELLED"}
         src     = lib.sources[lib.active_index]
-        targets = [o for o in context.selected_objects
-                   if o.type in {"MESH", "CURVE", "SURFACE", "META", "FONT", "GPENCIL"}]
+        targets = [
+            o for o in context.selected_objects
+            if o.type in {"MESH", "CURVE", "SURFACE", "META", "FONT", "GREASEPENCIL"}
+        ]
         if not targets:
             self.report({"WARNING"}, "No valid objects selected.")
             return {"CANCELLED"}
@@ -835,19 +877,43 @@ class HIST_OT_ExportReport(Operator):
 class HIST_OT_BatchExport(Operator):
     bl_idname      = "hist.batch_export"
     bl_label       = "Batch Export glTF / GLB"
-    bl_description = "Export objects as glTF/GLB with historical sources embedded as extras"
+    bl_description = (
+        "Export objects as glTF/GLB. Historical sources and uncertainty classifications "
+        "are embedded as extras via Blender's built-in custom property export."
+    )
+
+    def _prepare_extras(self, context, candidates):
+        """
+        Write extras as custom properties on each candidate object so the
+        built-in glTF exporter picks them up via export_extras=True.
+        Returns a list of objects that had extras written (for cleanup).
+        """
+        lib     = get_library(context)
+        written = []
+        for obj in candidates:
+            extras = build_extras_for_object(obj, lib)
+            if extras:
+                write_extras_to_object(obj, extras)
+                written.append(obj)
+        return written
+
+    def _cleanup_extras(self, written):
+        for obj in written:
+            clear_extras_from_object(obj)
 
     def execute(self, context):
         settings  = context.scene.hist_export_settings
-        lib       = get_library(context)
         directory = bpy.path.abspath(settings.directory)
         if not directory:
             self.report({"ERROR"}, "No export directory set.")
             return {"CANCELLED"}
         os.makedirs(directory, exist_ok=True)
 
-        exportable_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "GPENCIL"}
+        exportable_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "GREASEPENCIL"}
 
+        # ------------------------------------------------------------------ #
+        # SELECTED — SINGLE FILE                                            #
+        # ------------------------------------------------------------------ #
         if settings.export_scope == "SELECTED_SINGLE":
             candidates = [o for o in context.selected_objects if o.type in exportable_types]
             if settings.only_with_sources:
@@ -855,23 +921,31 @@ class HIST_OT_BatchExport(Operator):
             if not candidates:
                 self.report({"WARNING"}, "No exportable objects found in selection.")
                 return {"CANCELLED"}
-            filepath = os.path.join(directory, "selection" + file_extension_for_format(settings.file_format))
+
+            filepath = os.path.join(
+                directory, "selection" + file_extension_for_format(settings.file_format)
+            )
+            written = self._prepare_extras(context, candidates)
             try:
                 bpy.ops.export_scene.gltf(
-                    filepath=filepath, use_selection=True,
-                    export_format=settings.file_format, export_extras=False,
+                    filepath=filepath,
+                    use_selection=True,
+                    export_format=settings.file_format,
+                    export_extras=True,
+                    export_apply=settings.apply_modifiers,
                     export_materials="EXPORT" if settings.export_textures else "NONE",
                 )
-                for obj in candidates:
-                    extras_payload = sources_to_dict_for_export(obj, lib)
-                    if extras_payload:
-                        inject_extras_into_file(filepath, settings.file_format, obj.name, extras_payload)
             except Exception as e:
+                self._cleanup_extras(written)
                 self.report({"ERROR"}, f"Export failed: {e}")
                 return {"CANCELLED"}
+            self._cleanup_extras(written)
             self.report({"INFO"}, f"Exported {len(candidates)} object(s) to '{filepath}'.")
             return {"FINISHED"}
 
+        # ------------------------------------------------------------------ #
+        # ALL or SELECTED — one file per object                             #
+        # ------------------------------------------------------------------ #
         candidates = (
             list(context.selected_objects) if settings.export_scope == "SELECTED"
             else list(context.scene.objects)
@@ -888,6 +962,7 @@ class HIST_OT_BatchExport(Operator):
         exported, skipped  = [], []
 
         for obj in candidates:
+            written = self._prepare_extras(context, [obj])
             try:
                 bpy.ops.object.select_all(action="DESELECT")
                 obj.select_set(True)
@@ -897,16 +972,19 @@ class HIST_OT_BatchExport(Operator):
                     bpy.path.clean_name(obj.name) + file_extension_for_format(settings.file_format),
                 )
                 bpy.ops.export_scene.gltf(
-                    filepath=filepath, use_selection=True,
-                    export_format=settings.file_format, export_extras=False,
+                    filepath=filepath,
+                    use_selection=True,
+                    export_format=settings.file_format,
+                    export_extras=True,
+                    export_apply=settings.apply_modifiers,
                     export_materials="EXPORT" if settings.export_textures else "NONE",
                 )
-                inject_extras_into_file(filepath, settings.file_format, obj.name,
-                    sources_to_dict_for_export(obj, lib))
                 exported.append(obj.name)
             except Exception as e:
                 skipped.append(obj.name)
                 self.report({"WARNING"}, f"Failed '{obj.name}': {e}")
+            finally:
+                self._cleanup_extras(written)
 
         bpy.ops.object.select_all(action="DESELECT")
         for o in original_selection:
@@ -1110,6 +1188,15 @@ class HIST_PT_ExportPanel(Panel):
         col = layout.column(align=True)
         col.prop(s, "only_with_sources")
         col.prop(s, "export_textures")
+        col.prop(s, "apply_modifiers")
+        layout.separator()
+        box = layout.box()
+        box.label(text="Extras included in export:", icon="INFO")
+        col = box.column(align=True)
+        col.scale_y = 0.8
+        col.label(text="  historical_sources  (this addon)")
+        col.label(text="  uncertainty_index   (if assigned)")
+        col.label(text="  uncertainty_label   (if assigned)")
         layout.separator()
         layout.operator("hist.batch_export",  icon="EXPORT", text="Batch Export")
         layout.operator("hist.export_report", icon="TEXT")
