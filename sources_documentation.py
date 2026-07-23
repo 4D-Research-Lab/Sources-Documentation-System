@@ -361,12 +361,16 @@ class HistExportSettings(PropertyGroup):
     directory:         StringProperty(name="Export Directory", default="//exports/")
     file_format:       EnumProperty(name="Format", items=EXPORT_FORMAT, default="GLB")
     export_scope:      EnumProperty(name="Scope",  items=EXPORT_SCOPE,  default="ALL")
-    only_with_sources: BoolProperty(name="Only Objects with Sources", default=True)
     export_textures:   BoolProperty(name="Include Textures",          default=True)
     apply_modifiers:   BoolProperty(
         name="Apply Modifiers",
         description="Apply modifiers to exported meshes",
         default=False,
+    )
+    export_collections: BoolProperty(
+        name="Full Collection Hierarchy",
+        description="Export collections as empty nodes to preserve hierarchy",
+        default=True,
     )
 
 class HistImportSettings(PropertyGroup):
@@ -935,8 +939,6 @@ class HIST_OT_BatchExport(Operator):
         # ------------------------------------------------------------------ #
         if settings.export_scope == "SELECTED_SINGLE":
             candidates = [o for o in context.selected_objects if o.type in exportable_types]
-            if settings.only_with_sources:
-                candidates = [o for o in candidates if o.hist_source_refs.refs]
             if not candidates:
                 self.report({"WARNING"}, "No exportable objects found in selection.")
                 return {"CANCELLED"}
@@ -952,7 +954,8 @@ class HIST_OT_BatchExport(Operator):
                     export_format=settings.file_format,
                     export_extras=True,
                     export_apply=settings.apply_modifiers,
-                    export_materials="EXPORT" if settings.export_textures else "NONE",
+                    export_hierarchy_full_collections=settings.export_collections,
+                    export_materials="EXPORT" if settings.export_textures else "NONE",        
                 )
             except Exception as e:
                 self._cleanup_extras(written)
@@ -969,8 +972,6 @@ class HIST_OT_BatchExport(Operator):
             list(context.selected_objects) if settings.export_scope == "SELECTED"
             else list(context.scene.objects)
         )
-        if settings.only_with_sources:
-            candidates = [o for o in candidates if o.hist_source_refs.refs]
         candidates = [o for o in candidates if o.type in exportable_types]
         if not candidates:
             self.report({"WARNING"}, "No exportable objects found.")
@@ -996,6 +997,7 @@ class HIST_OT_BatchExport(Operator):
                     export_format=settings.file_format,
                     export_extras=True,
                     export_apply=settings.apply_modifiers,
+                    export_hierarchy_full_collections=settings.export_collections,
                     export_materials="EXPORT" if settings.export_textures else "NONE",
                 )
                 exported.append(obj.name)
@@ -1207,7 +1209,7 @@ class HIST_PT_ExportPanel(Panel):
         layout.row(align=True).prop(s, "file_format",  expand=True)
         layout.row(align=True).prop(s, "export_scope", expand=True)
         col = layout.column(align=True)
-        col.prop(s, "only_with_sources")
+        col.prop(s, "export_collections")
         col.prop(s, "export_textures")
         col.prop(s, "apply_modifiers")
         layout.separator()
