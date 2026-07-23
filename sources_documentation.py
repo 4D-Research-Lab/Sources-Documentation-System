@@ -329,6 +329,11 @@ class HistExportSettings(PropertyGroup):
     export_collections:  BoolProperty(name="Full Collection Hierarchy",
                              description="Export collections as empty nodes to preserve hierarchy",
                              default=True)
+    export_filename: StringProperty(
+    name="File Name",
+    description="File name for single-file export (without extension)",
+    default="export")
+    
 
 class HistImportSettings(PropertyGroup):
     filepath: StringProperty(name="File",
@@ -876,8 +881,9 @@ class HIST_OT_BatchExport(Operator):
             if not candidates:
                 self.report({"WARNING"}, "No exportable objects found in selection.")
                 return {"CANCELLED"}
+            filename = settings.export_filename.strip() or "export"
             filepath = os.path.join(
-                directory, "selection" + file_extension_for_format(settings.file_format)
+                directory, filename + file_extension_for_format(settings.file_format)
             )
             written = self._prepare_extras(context, candidates)
             try:
@@ -1140,6 +1146,8 @@ class HIST_PT_ExportPanel(Panel):
         row.operator("hist.browse_export_dir", text="", icon="FILE_FOLDER")
         layout.row(align=True).prop(s, "file_format",  expand=True)
         layout.row(align=True).prop(s, "export_scope", expand=True)
+        if s.export_scope == "SELECTED_SINGLE":
+            layout.prop(s, "export_filename")
         col = layout.column(align=True)
         col.prop(s, "export_textures")
         col.prop(s, "apply_modifiers")
