@@ -1,6 +1,8 @@
+# sources_documentation.py
+
 bl_info = {
     "name": "Historical Source Documentation",
-    "author": "Your Name",
+    "author": "Tijm Lanjouw/Claude Sonnet 4.6",
     "version": (1, 7, 9),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Hist. Sources",
@@ -14,6 +16,7 @@ import json
 import uuid
 import struct
 import csv
+import math
 import webbrowser
 from bpy.types import PropertyGroup, Panel, Operator, UIList
 from bpy.props import (
@@ -83,17 +86,8 @@ RELIABILITY_ICONS = {
 EXTRAS_KEY = "historical_sources"
 
 CSV_HEADER = [
-    "source_id",
-    "title",
-    "source_type",
-    "date",
-    "toponym",
-    "repository",
-    "inventory_nr",
-    "url",
-    "reliability",
-    "description",
-    "notes",
+    "source_id", "title", "source_type", "date", "toponym",
+    "repository", "inventory_nr", "url", "reliability", "description", "notes",
 ]
 
 TYPE_MAP = [
@@ -119,7 +113,6 @@ TYPE_MAP = [
     ("gravure",    "ENGRAVING"),
 ]
 
-
 def map_source_type(raw):
     if not raw:
         return "OTHER"
@@ -128,7 +121,6 @@ def map_source_type(raw):
         if keyword in low:
             return enum_val
     return "OTHER"
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -175,49 +167,94 @@ def sources_to_dict_for_export(obj, library):
 def file_extension_for_format(fmt):
     return ".glb" if fmt == "GLB" else ".gltf"
 
-
 def source_passes_filter(src, lib):
     """Return True if src matches all active filters on the library."""
-    f_inv      = lib.filter_inventory_nr.strip().lower()
-    f_title    = lib.filter_title.strip().lower()
-    f_toponym  = lib.filter_toponym.strip().lower()
-    f_date     = lib.filter_date.strip().lower()
-    f_type     = lib.filter_type       # enum value or "ALL"
-    f_rel      = lib.filter_reliability  # enum value or "ALL"
+    f_inv     = lib.filter_inventory_nr.strip().lower()
+    f_title   = lib.filter_title.strip().lower()
+    f_toponym = lib.filter_toponym.strip().lower()
+    f_date    = lib.filter_date.strip().lower()
+    f_type    = lib.filter_type
+    f_rel     = lib.filter_reliability
 
-    if f_inv     and f_inv     not in src.inventory_nr.lower():
-        return False
-    if f_title   and f_title   not in src.title.lower():
-        return False
-    if f_toponym and f_toponym not in src.toponym.lower():
-        return False
-    if f_date    and f_date    not in src.date.lower():
-        return False
-    if f_type != "ALL"  and src.source_type != f_type:
-        return False
-    if f_rel  != "ALL"  and src.reliability  != f_rel:
-        return False
+    if f_inv     and f_inv     not in src.inventory_nr.lower(): return False
+    if f_title   and f_title   not in src.title.lower():        return False
+    if f_toponym and f_toponym not in src.toponym.lower():      return False
+    if f_date    and f_date    not in src.date.lower():         return False
+    if f_type != "ALL" and src.source_type != f_type:           return False
+    if f_rel  != "ALL" and src.reliability  != f_rel:           return False
     return True
-
 
 def filters_active(lib):
     return (
         lib.filter_inventory_nr.strip() != "" or
-        lib.filter_title.strip()    != "" or
-        lib.filter_toponym.strip()  != "" or
-        lib.filter_date.strip()     != "" or
-        lib.filter_type             != "ALL" or
-        lib.filter_reliability      != "ALL"
+        lib.filter_title.strip()        != "" or
+        lib.filter_toponym.strip()      != "" or
+        lib.filter_date.strip()         != "" or
+        lib.filter_type                 != "ALL" or
+        lib.filter_reliability          != "ALL"
     )
 
+# ---------------------------------------------------------------------------
+# Shared helper: write all fields of a HistoricalSource in one call
+# ---------------------------------------------------------------------------
+
+def _copy_source_fields(src, sid, title, stype, date, topo, repo, inv, url, rel, desc, notes):
+    src.source_id    = sid
+    src.title        = title
+    src.source_type  = stype
+    src.date         = date
+    src.toponym      = topo
+    src.repository   = repo
+    src.inventory_nr = inv
+    src.url          = url
+    src.reliability  = rel
+    src.description  = desc
+    src.notes        = notes
+
+# ---------------------------------------------------------------------------
+# Shared helper: import rows into library (deduplicates skip logic)
+# ---------------------------------------------------------------------------
+
+def _import_rows_into_library(lib, rows, skip_duplicates):
+    """
+    rows: list of dicts keyed by HistoricalSource field names.
+    Returns (added, skipped).
+    """
+    existing_titles = {s.title for s in lib.sources} if skip_duplicates else set()
+    added = skipped = 0
+    for row in rows:
+        title = (row.get("title") or "").strip()
+        if not title:
+            skipped += 1
+            continue
+        if skip_duplicates and title in existing_titles:
+            skipped += 1
+            continue
+        rel = (row.get("reliability") or "MEDIUM").strip().upper()
+        _copy_source_fields(
+            lib.sources.add(),
+            sid   = (row.get("source_id")    or generate_id()).strip(),
+            title = title,
+            stype = (row.get("source_type")  or "OTHER").strip(),
+            date  = (row.get("date")         or "").strip(),
+            topo  = (row.get("toponym")      or "").strip(),
+            repo  = (row.get("repository")   or "").strip(),
+            inv   = (row.get("inventory_nr") or "").strip(),
+            url   = (row.get("url")          or "").strip(),
+            rel   = rel if rel in {"HIGH", "MEDIUM", "LOW"} else "MEDIUM",
+            desc  = (row.get("description")  or "").strip(),
+            notes = (row.get("notes")        or "").strip(),
+        )
+        existing_titles.add(title)
+        added += 1
+    return added, skipped
 
 # ---------------------------------------------------------------------------
 # Post-export extras injection
 # ---------------------------------------------------------------------------
 
 def _patch_gltf_json(gltf_data, obj_name, extras_payload):
-    nodes = gltf_data.get("nodes", [])
-    for node in nodes:
+    for node in gltf_data.get("nodes", []):
         if node.get("name") == obj_name:
             node.setdefault("extras", {})[EXTRAS_KEY] = extras_payload
     return gltf_data
@@ -239,16 +276,16 @@ def inject_extras_into_glb(filepath, obj_name, extras_payload):
     json_chunk_type = struct.unpack_from("<I", raw, 16)[0]
     if json_chunk_type != 0x4E4F534A:
         raise ValueError("First GLB chunk is not JSON.")
-    json_bytes = raw[20 : 20 + json_chunk_len]
-    gltf_data  = json.loads(json_bytes.decode("utf-8"))
-    gltf_data  = _patch_gltf_json(gltf_data, obj_name, extras_payload)
+    json_bytes     = raw[20 : 20 + json_chunk_len]
+    gltf_data      = json.loads(json_bytes.decode("utf-8"))
+    gltf_data      = _patch_gltf_json(gltf_data, obj_name, extras_payload)
     new_json_bytes = json.dumps(gltf_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    pad = (4 - len(new_json_bytes) % 4) % 4
+    pad            = (4 - len(new_json_bytes) % 4) % 4
     new_json_bytes += b" " * pad
-    rest = raw[20 + json_chunk_len:]
+    rest           = raw[20 + json_chunk_len:]
     new_json_chunk = struct.pack("<II", len(new_json_bytes), 0x4E4F534A) + new_json_bytes
-    new_total = 12 + len(new_json_chunk) + len(rest)
-    new_header = struct.pack("<III", magic, version, new_total)
+    new_total      = 12 + len(new_json_chunk) + len(rest)
+    new_header     = struct.pack("<III", magic, version, new_total)
     with open(filepath, "wb") as f:
         f.write(new_header + new_json_chunk + rest)
 
@@ -257,7 +294,6 @@ def inject_extras_into_file(filepath, fmt, obj_name, extras_payload):
         inject_extras_into_glb(filepath, obj_name, extras_payload)
     else:
         inject_extras_into_gltf(filepath, obj_name, extras_payload)
-
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -276,38 +312,32 @@ class HistoricalSource(PropertyGroup):
     description:  StringProperty(name="Description",          default="")
     notes:        StringProperty(name="Notes",                default="")
 
-
-# Filter type/reliability enums include an "ALL" sentinel
 FILTER_TYPE_ITEMS = [("ALL", "All Types", "")] + list(SOURCE_TYPES)
 FILTER_REL_ITEMS  = [("ALL", "All",       "")] + list(RELIABILITY)
 
-
 class HistoricalSourceLibrary(PropertyGroup):
-    sources:      CollectionProperty(type=HistoricalSource)
-    active_index: IntProperty(name="Active Library Index", default=0)
-    sort_order:   EnumProperty(
-        name="Sort By",
-        items=SORT_OPTIONS,
-        default="NONE",
-        description="Sort the source library list",
-    )
-    # --- filter fields ---
-    filter_inventory_nr:StringProperty(name="Inventory No.", default="", description="Filter by inventory number (substring, case-insensitive)")
-    filter_title:       StringProperty(name="Title",    default="",    description="Filter by title (substring, case-insensitive)")
-    filter_toponym:     StringProperty(name="Toponym",  default="",    description="Filter by toponym (substring, case-insensitive)")
-    filter_date:        StringProperty(name="Date",     default="",    description="Filter by date string (substring, case-insensitive)")
-    filter_type:        EnumProperty(  name="Type",     items=FILTER_TYPE_ITEMS, default="ALL", description="Filter by source type")
-    filter_reliability: EnumProperty(  name="Reliability", items=FILTER_REL_ITEMS,  default="ALL", description="Filter by reliability")
-    show_filters:       BoolProperty(  name="Show Filters", default=False)
-
+    sources:             CollectionProperty(type=HistoricalSource)
+    active_index:        IntProperty(name="Active Library Index", default=0)
+    sort_order:          EnumProperty(name="Sort By", items=SORT_OPTIONS, default="NONE",
+                             description="Sort the source library list")
+    filter_inventory_nr: StringProperty(name="Inventory No.", default="",
+                             description="Filter by inventory number (substring, case-insensitive)")
+    filter_title:        StringProperty(name="Title",    default="",
+                             description="Filter by title (substring, case-insensitive)")
+    filter_toponym:      StringProperty(name="Toponym",  default="",
+                             description="Filter by toponym (substring, case-insensitive)")
+    filter_date:         StringProperty(name="Date",     default="",
+                             description="Filter by date string (substring, case-insensitive)")
+    filter_type:         EnumProperty(  name="Type",        items=FILTER_TYPE_ITEMS, default="ALL",
+                             description="Filter by source type")
+    filter_reliability:  EnumProperty(  name="Reliability", items=FILTER_REL_ITEMS,  default="ALL",
+                             description="Filter by reliability")
+    show_filters:        BoolProperty(  name="Show Filters", default=False)
 
 class ObjectSourceRef(PropertyGroup):
     source_id: StringProperty(name="Source ID", default="")
-    part_note: StringProperty(
-        name="Part Note",
-        description="Which part of this object the source applies to",
-        default="",
-    )
+    part_note: StringProperty(name="Part Note",
+        description="Which part of this object the source applies to", default="")
 
 class ObjectSourceRefs(PropertyGroup):
     refs:         CollectionProperty(type=ObjectSourceRef)
@@ -321,24 +351,14 @@ class HistExportSettings(PropertyGroup):
     export_textures:   BoolProperty(name="Include Textures",          default=True)
 
 class HistImportSettings(PropertyGroup):
-    filepath: StringProperty(
-        name="File",
+    filepath: StringProperty(name="File",
         description="Path to an Excel (.xlsx) or CSV (.csv) file containing sources",
-        default="",
-        subtype="FILE_PATH",
-    )
-    skip_duplicates: BoolProperty(
-        name="Skip Duplicate Titles",
-        description="Skip rows whose Title already exists in the library",
-        default=True,
-    )
-    default_reliability: EnumProperty(
-        name="Default Reliability",
+        default="", subtype="FILE_PATH")
+    skip_duplicates: BoolProperty(name="Skip Duplicate Titles",
+        description="Skip rows whose Title already exists in the library", default=True)
+    default_reliability: EnumProperty(name="Default Reliability",
         description="Reliability assigned to all imported sources",
-        items=RELIABILITY,
-        default="MEDIUM",
-    )
-
+        items=RELIABILITY, default="MEDIUM")
 
 # ---------------------------------------------------------------------------
 # UI Lists
@@ -346,48 +366,36 @@ class HistImportSettings(PropertyGroup):
 
 class HIST_UL_LibraryList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
-        lib = context.scene.hist_source_library
-        # Grey out rows that don't pass the current filter
-        row = layout.row(align=True)
-        passes = source_passes_filter(item, lib)
-        row.active = passes
         if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
             row.label(text="", icon=SOURCE_TYPE_ICONS.get(item.source_type, "QUESTION"))
+            title_col = row.row(align=True)
+            title_col.ui_units_x = 7
+            title_col.label(text=item.title if item.title else "-")
             inv_col = row.row(align=True)
-            inv_col.ui_units_x = 6
+            inv_col.ui_units_x = 3
             inv_col.label(text=item.inventory_nr if item.inventory_nr else "-")
-            topo_col = row.row(align=True)
-            topo_col.ui_units_x = 5
-            topo_col.label(text=item.toponym if item.toponym else "-")
             date_col = row.row(align=True)
-            date_col.ui_units_x = 4
+            date_col.ui_units_x = 1
             date_col.label(text=item.date if item.date else "-")
             row.label(text="", icon=RELIABILITY_ICONS.get(item.reliability, "QUESTION"))
             if is_url(item.url):
                 op = row.operator("hist.open_url", text="", icon="URL", emboss=False)
                 op.url = item.url
             else:
-                row.label(text="", icon="BLANK1")  # keeps row width stable
+                row.label(text="", icon="BLANK1")
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
             layout.label(text="", icon=SOURCE_TYPE_ICONS.get(item.source_type, "QUESTION"))
 
     def filter_items(self, context, data, propname):
-        """
-        Use Blender's built-in filter mechanism to hide non-matching items.
-        Returns (filter_flags, reorder_indices).
-        filter_flags: per-item bitmask — FILTER_ITEM means "show".
-        """
         lib     = context.scene.hist_source_library
         sources = getattr(data, propname)
-        flags   = []
-        for src in sources:
-            if source_passes_filter(src, lib):
-                flags.append(self.bitflag_filter_item)
-            else:
-                flags.append(0)
+        flags   = [
+            self.bitflag_filter_item if source_passes_filter(src, lib) else 0
+            for src in sources
+        ]
         return flags, []
-
 
 class HIST_UL_ObjectRefList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
@@ -405,11 +413,8 @@ class HIST_UL_ObjectRefList(UIList):
                 row.label(text=f"[missing] {item.source_id[:8]}...", icon="ERROR")
         elif self.layout_type == "GRID":
             layout.alignment = "CENTER"
-            layout.label(
-                text="",
-                icon=SOURCE_TYPE_ICONS.get(src.source_type, "QUESTION") if src else "ERROR",
-            )
-
+            layout.label(text="",
+                icon=SOURCE_TYPE_ICONS.get(src.source_type, "QUESTION") if src else "ERROR")
 
 # ---------------------------------------------------------------------------
 # Operators — filter clear
@@ -423,22 +428,21 @@ class HIST_OT_ClearFilters(Operator):
     def execute(self, context):
         lib = get_library(context)
         lib.filter_inventory_nr = ""
-        lib.filter_title       = ""
-        lib.filter_toponym     = ""
-        lib.filter_date        = ""
-        lib.filter_type        = "ALL"
-        lib.filter_reliability = "ALL"
+        lib.filter_title        = ""
+        lib.filter_toponym      = ""
+        lib.filter_date         = ""
+        lib.filter_type         = "ALL"
+        lib.filter_reliability  = "ALL"
         self.report({"INFO"}, "Filters cleared.")
         return {"FINISHED"}
-
 
 # ---------------------------------------------------------------------------
 # Operators — URL
 # ---------------------------------------------------------------------------
 
 class HIST_OT_OpenURL(Operator):
-    bl_idname = "hist.open_url"
-    bl_label = "Open URL"
+    bl_idname      = "hist.open_url"
+    bl_label       = "Open URL"
     bl_description = "Open this URL in your web browser"
     url: StringProperty(name="URL", default="")
 
@@ -453,28 +457,26 @@ class HIST_OT_OpenURL(Operator):
         self.report({"INFO"}, f"Opened: {self.url}")
         return {"FINISHED"}
 
-
 # ---------------------------------------------------------------------------
 # Operators — Library management
 # ---------------------------------------------------------------------------
 
 class HIST_OT_LibAddSource(Operator):
-    bl_idname = "hist.lib_add_source"
-    bl_label = "Add Source to Library"
+    bl_idname      = "hist.lib_add_source"
+    bl_label       = "Add Source to Library"
     bl_description = "Add a new source to the scene library"
 
     def execute(self, context):
         lib = get_library(context)
         src = lib.sources.add()
-        src.source_id = generate_id()
-        src.title = "New Source"
+        src.source_id    = generate_id()
+        src.title        = "New Source"
         lib.active_index = len(lib.sources) - 1
         return {"FINISHED"}
 
-
 class HIST_OT_LibRemoveSource(Operator):
-    bl_idname = "hist.lib_remove_source"
-    bl_label = "Remove Source from Library"
+    bl_idname      = "hist.lib_remove_source"
+    bl_label       = "Remove Source from Library"
     bl_description = "Remove the selected source from the scene library"
 
     def execute(self, context):
@@ -493,10 +495,9 @@ class HIST_OT_LibRemoveSource(Operator):
             self.report({"WARNING"}, f"Source removed but still referenced by: {', '.join(orphaned)}")
         return {"FINISHED"}
 
-
 class HIST_OT_LibDuplicateSource(Operator):
-    bl_idname = "hist.lib_duplicate_source"
-    bl_label = "Duplicate Source"
+    bl_idname      = "hist.lib_duplicate_source"
+    bl_label       = "Duplicate Source"
     bl_description = "Duplicate the selected library source (assigns a new ID)"
 
     def execute(self, context):
@@ -505,21 +506,22 @@ class HIST_OT_LibDuplicateSource(Operator):
         if not (0 <= idx < len(lib.sources)):
             return {"CANCELLED"}
         o = lib.sources[idx]
-        n = lib.sources.add()
-        n.source_id    = generate_id()
-        n.title        = o.title + " (copy)"
-        n.source_type  = o.source_type
-        n.date         = o.date
-        n.toponym      = o.toponym
-        n.repository   = o.repository
-        n.inventory_nr = o.inventory_nr
-        n.url          = o.url
-        n.reliability  = o.reliability
-        n.description  = o.description
-        n.notes        = o.notes
+        _copy_source_fields(
+            lib.sources.add(),
+            sid   = generate_id(),
+            title = o.title + " (copy)",
+            stype = o.source_type,
+            date  = o.date,
+            topo  = o.toponym,
+            repo  = o.repository,
+            inv   = o.inventory_nr,
+            url   = o.url,
+            rel   = o.reliability,
+            desc  = o.description,
+            notes = o.notes,
+        )
         lib.active_index = len(lib.sources) - 1
         return {"FINISHED"}
-
 
 class HIST_OT_LibClearAll(Operator):
     bl_idname      = "hist.lib_clear_all"
@@ -531,12 +533,11 @@ class HIST_OT_LibClearAll(Operator):
 
     def execute(self, context):
         lib = get_library(context)
-        n = len(lib.sources)
+        n   = len(lib.sources)
         lib.sources.clear()
         lib.active_index = 0
         self.report({"INFO"}, f"Library cleared ({n} sources removed).")
         return {"FINISHED"}
-
 
 class HIST_OT_SortSources(Operator):
     bl_idname      = "hist.sort_sources"
@@ -550,11 +551,9 @@ class HIST_OT_SortSources(Operator):
             return {"FINISHED"}
 
         items = [
-            (
-                src.source_id, src.title, src.source_type, src.date,
-                src.toponym, src.repository, src.inventory_nr, src.url,
-                src.reliability, src.description, src.notes,
-            )
+            (src.source_id, src.title, src.source_type, src.date,
+             src.toponym, src.repository, src.inventory_nr, src.url,
+             src.reliability, src.description, src.notes)
             for src in lib.sources
         ]
 
@@ -571,18 +570,10 @@ class HIST_OT_SortSources(Operator):
         lib.sources.clear()
 
         for sid, title, stype, date, topo, repo, inv, url, rel, desc, notes in items:
-            src = lib.sources.add()
-            src.source_id    = sid
-            src.title        = title
-            src.source_type  = stype
-            src.date         = date
-            src.toponym      = topo
-            src.repository   = repo
-            src.inventory_nr = inv
-            src.url          = url
-            src.reliability  = rel
-            src.description  = desc
-            src.notes        = notes
+            _copy_source_fields(
+                lib.sources.add(),
+                sid, title, stype, date, topo, repo, inv, url, rel, desc, notes,
+            )
 
         for i, src in enumerate(lib.sources):
             if src.source_id == active_id:
@@ -591,7 +582,6 @@ class HIST_OT_SortSources(Operator):
 
         self.report({"INFO"}, f"Library sorted by {lib.sort_order.lower()}.")
         return {"FINISHED"}
-
 
 # ---------------------------------------------------------------------------
 # Operators — Library CSV export / import
@@ -628,7 +618,6 @@ class HIST_OT_LibraryExportCSV(Operator):
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
-
 class HIST_OT_LibraryImportCSV(Operator):
     bl_idname      = "hist.library_import_csv"
     bl_label       = "Import Library from CSV"
@@ -636,16 +625,10 @@ class HIST_OT_LibraryImportCSV(Operator):
 
     filepath:        StringProperty(name="File Path", subtype="FILE_PATH")
     filter_glob:     StringProperty(default="*.csv", options={"HIDDEN"})
-    clear_before:    BoolProperty(
-        name="Clear Library First",
-        description="Remove all existing sources before importing",
-        default=False,
-    )
-    skip_duplicates: BoolProperty(
-        name="Skip Duplicate Titles",
-        description="Skip rows whose Title already exists in the library",
-        default=True,
-    )
+    clear_before:    BoolProperty(name="Clear Library First",
+                         description="Remove all existing sources before importing", default=False)
+    skip_duplicates: BoolProperty(name="Skip Duplicate Titles",
+                         description="Skip rows whose Title already exists in the library", default=True)
 
     def execute(self, context):
         lib  = get_library(context)
@@ -653,14 +636,9 @@ class HIST_OT_LibraryImportCSV(Operator):
         if not os.path.isfile(path):
             self.report({"ERROR"}, f"File not found: {path}")
             return {"CANCELLED"}
-
         if self.clear_before:
             lib.sources.clear()
             lib.active_index = 0
-
-        existing_titles = {s.title for s in lib.sources} if self.skip_duplicates else set()
-        added = skipped = 0
-
         try:
             with open(path, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -668,33 +646,12 @@ class HIST_OT_LibraryImportCSV(Operator):
                 if missing:
                     self.report({"ERROR"}, f"CSV missing columns: {', '.join(missing)}")
                     return {"CANCELLED"}
-                for row in reader:
-                    title = (row.get("title") or "").strip()
-                    if not title:
-                        skipped += 1
-                        continue
-                    if self.skip_duplicates and title in existing_titles:
-                        skipped += 1
-                        continue
-                    src = lib.sources.add()
-                    src.source_id    = (row.get("source_id") or generate_id()).strip()
-                    src.title        = title
-                    src.source_type  = (row.get("source_type") or "OTHER").strip()
-                    src.date         = (row.get("date") or "").strip()
-                    src.toponym      = (row.get("toponym") or "").strip()
-                    src.repository   = (row.get("repository") or "").strip()
-                    src.inventory_nr = (row.get("inventory_nr") or "").strip()
-                    src.url          = (row.get("url") or "").strip()
-                    rel = (row.get("reliability") or "MEDIUM").strip().upper()
-                    src.reliability  = rel if rel in {"HIGH", "MEDIUM", "LOW"} else "MEDIUM"
-                    src.description  = (row.get("description") or "").strip()
-                    src.notes        = (row.get("notes") or "").strip()
-                    existing_titles.add(title)
-                    added += 1
+                rows = list(reader)
         except Exception as e:
             self.report({"ERROR"}, f"Failed to read CSV: {e}")
             return {"CANCELLED"}
 
+        added, skipped = _import_rows_into_library(lib, rows, self.skip_duplicates)
         lib.active_index = max(0, len(lib.sources) - 1)
         self.report({"INFO"}, f"Imported {added} source(s) from CSV, skipped {skipped}.")
         return {"FINISHED"}
@@ -703,25 +660,22 @@ class HIST_OT_LibraryImportCSV(Operator):
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
-
 # ---------------------------------------------------------------------------
 # Operators — Object references
 # ---------------------------------------------------------------------------
 
 class HIST_OT_LinkToSelected(Operator):
-    bl_idname = "hist.link_to_selected"
-    bl_label = "Link to Selected Objects"
-    bl_description = (
-        "Link the active library source to all selected objects. "
-        "Objects that already have this source linked are skipped."
-    )
+    bl_idname      = "hist.link_to_selected"
+    bl_label       = "Link to Selected Objects"
+    bl_description = ("Link the active library source to all selected objects. "
+                      "Objects that already have this source linked are skipped.")
 
     def execute(self, context):
         lib = get_library(context)
         if not lib.sources:
             self.report({"WARNING"}, "No sources in library.")
             return {"CANCELLED"}
-        src = lib.sources[lib.active_index]
+        src     = lib.sources[lib.active_index]
         targets = [o for o in context.selected_objects
                    if o.type in {"MESH", "CURVE", "SURFACE", "META", "FONT", "GPENCIL"}]
         if not targets:
@@ -742,10 +696,9 @@ class HIST_OT_LinkToSelected(Operator):
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
-
 class HIST_OT_RefRemoveSource(Operator):
-    bl_idname = "hist.ref_remove_source"
-    bl_label = "Unlink Source from Object"
+    bl_idname      = "hist.ref_remove_source"
+    bl_label       = "Unlink Source from Object"
     bl_description = "Remove the selected source reference from the active object"
 
     def execute(self, context):
@@ -756,13 +709,11 @@ class HIST_OT_RefRemoveSource(Operator):
             refs.active_index = max(0, idx - 1)
         return {"FINISHED"}
 
-
 # ---------------------------------------------------------------------------
 # Operators — Excel / external CSV import into library
 # ---------------------------------------------------------------------------
 
 def _cell(row, key):
-    import math
     val = row.get(key, "")
     if val is None:
         return ""
@@ -782,7 +733,6 @@ def _build_date(row):
         return f"{date} ({range_str})" if date else range_str
     return date
 
-
 class HIST_OT_ImportSources(Operator):
     bl_idname      = "hist.import_sources"
     bl_label       = "Import Sources"
@@ -791,14 +741,12 @@ class HIST_OT_ImportSources(Operator):
     def execute(self, context):
         settings = context.scene.hist_import_settings
         filepath = bpy.path.abspath(settings.filepath)
-
         if not filepath:
             self.report({"ERROR"}, "No file path set.")
             return {"CANCELLED"}
         if not os.path.isfile(filepath):
             self.report({"ERROR"}, f"File not found: {filepath}")
             return {"CANCELLED"}
-
         try:
             import pandas as pd
             ext = os.path.splitext(filepath)[1].lower()
@@ -817,51 +765,38 @@ class HIST_OT_ImportSources(Operator):
             self.report({"ERROR"}, "File must contain a 'Title' column.")
             return {"CANCELLED"}
 
-        lib = get_library(context)
-        existing_titles = {s.title for s in lib.sources} if settings.skip_duplicates else set()
-        added = skipped = 0
+        lib  = get_library(context)
+        rows = []
+        for raw in df.to_dict(orient="records"):
+            rows.append({
+                "title":        _cell(raw, "Title"),
+                "source_type":  map_source_type(_cell(raw, "Type")),
+                "date":         _build_date(raw),
+                "toponym":      _cell(raw, "Toponym"),
+                "repository":   _cell(raw, "Origin"),
+                "inventory_nr": _cell(raw, "File Name"),
+                "url":          _cell(raw, "Link"),
+                "reliability":  settings.default_reliability,
+                "description":  _cell(raw, "Description"),
+                "notes":        "",
+            })
 
-        for row in df.to_dict(orient="records"):
-            title = _cell(row, "Title")
-            if not title:
-                skipped += 1
-                continue
-            if title in existing_titles:
-                skipped += 1
-                continue
-
-            src = lib.sources.add()
-            src.source_id    = generate_id()
-            src.title        = title
-            src.source_type  = map_source_type(_cell(row, "Type"))
-            src.date         = _build_date(row)
-            src.toponym      = _cell(row, "Toponym")
-            src.repository   = _cell(row, "Origin")
-            src.inventory_nr = _cell(row, "File Name")
-            src.url          = _cell(row, "Link")
-            src.reliability  = settings.default_reliability
-            src.description  = _cell(row, "Description")
-            src.notes        = ""
-
-            existing_titles.add(title)
-            added += 1
-
+        added, skipped = _import_rows_into_library(lib, rows, settings.skip_duplicates)
         lib.active_index = max(0, len(lib.sources) - 1)
         self.report({"INFO"}, f"Imported {added} source(s), skipped {skipped}.")
         return {"FINISHED"}
-
 
 # ---------------------------------------------------------------------------
 # Operators — glTF batch export + text report
 # ---------------------------------------------------------------------------
 
 class HIST_OT_ExportReport(Operator):
-    bl_idname = "hist.export_report"
-    bl_label = "Export Source Report"
+    bl_idname      = "hist.export_report"
+    bl_label       = "Export Source Report"
     bl_description = "Write a full source report for all objects to a text block"
 
     def execute(self, context):
-        lib = get_library(context)
+        lib   = get_library(context)
         lines = ["HISTORICAL SOURCE REPORT", "=" * 60, ""]
         for obj in context.scene.objects:
             pairs = resolve_object_sources(obj, lib)
@@ -897,10 +832,9 @@ class HIST_OT_ExportReport(Operator):
         self.report({"INFO"}, f"Report written to Text Editor: '{name}'")
         return {"FINISHED"}
 
-
 class HIST_OT_BatchExport(Operator):
-    bl_idname = "hist.batch_export"
-    bl_label = "Batch Export glTF / GLB"
+    bl_idname      = "hist.batch_export"
+    bl_label       = "Batch Export glTF / GLB"
     bl_description = "Export objects as glTF/GLB with historical sources embedded as extras"
 
     def execute(self, context):
@@ -914,53 +848,32 @@ class HIST_OT_BatchExport(Operator):
 
         exportable_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "GPENCIL"}
 
-        # ------------------------------------------------------------------ #
-        # SELECTED — SINGLE FILE                                               #
-        # ------------------------------------------------------------------ #
         if settings.export_scope == "SELECTED_SINGLE":
-            candidates = [
-                o for o in context.selected_objects
-                if o.type in exportable_types
-            ]
+            candidates = [o for o in context.selected_objects if o.type in exportable_types]
             if settings.only_with_sources:
                 candidates = [o for o in candidates if o.hist_source_refs.refs]
             if not candidates:
                 self.report({"WARNING"}, "No exportable objects found in selection.")
                 return {"CANCELLED"}
-
-            filepath = os.path.join(
-                directory,
-                "selection" + file_extension_for_format(settings.file_format),
-            )
+            filepath = os.path.join(directory, "selection" + file_extension_for_format(settings.file_format))
             try:
-                # Export all selected objects together
                 bpy.ops.export_scene.gltf(
-                    filepath=filepath,
-                    use_selection=True,
-                    export_format=settings.file_format,
-                    export_extras=False,
+                    filepath=filepath, use_selection=True,
+                    export_format=settings.file_format, export_extras=False,
                     export_materials="EXPORT" if settings.export_textures else "NONE",
                 )
-                # Patch each object's node in the shared file
                 for obj in candidates:
                     extras_payload = sources_to_dict_for_export(obj, lib)
                     if extras_payload:
-                        inject_extras_into_file(
-                            filepath, settings.file_format, obj.name, extras_payload
-                        )
+                        inject_extras_into_file(filepath, settings.file_format, obj.name, extras_payload)
             except Exception as e:
                 self.report({"ERROR"}, f"Export failed: {e}")
                 return {"CANCELLED"}
-
             self.report({"INFO"}, f"Exported {len(candidates)} object(s) to '{filepath}'.")
             return {"FINISHED"}
 
-        # ------------------------------------------------------------------ #
-        # ALL or SELECTED — one file per object (existing behaviour)           #
-        # ------------------------------------------------------------------ #
         candidates = (
-            list(context.selected_objects)
-            if settings.export_scope == "SELECTED"
+            list(context.selected_objects) if settings.export_scope == "SELECTED"
             else list(context.scene.objects)
         )
         if settings.only_with_sources:
@@ -979,22 +892,17 @@ class HIST_OT_BatchExport(Operator):
                 bpy.ops.object.select_all(action="DESELECT")
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
-                safe_name = bpy.path.clean_name(obj.name)
-                filepath  = os.path.join(
+                filepath = os.path.join(
                     directory,
-                    safe_name + file_extension_for_format(settings.file_format),
+                    bpy.path.clean_name(obj.name) + file_extension_for_format(settings.file_format),
                 )
                 bpy.ops.export_scene.gltf(
-                    filepath=filepath,
-                    use_selection=True,
-                    export_format=settings.file_format,
-                    export_extras=False,
+                    filepath=filepath, use_selection=True,
+                    export_format=settings.file_format, export_extras=False,
                     export_materials="EXPORT" if settings.export_textures else "NONE",
                 )
-                extras_payload = sources_to_dict_for_export(obj, lib)
-                inject_extras_into_file(
-                    filepath, settings.file_format, obj.name, extras_payload
-                )
+                inject_extras_into_file(filepath, settings.file_format, obj.name,
+                    sources_to_dict_for_export(obj, lib))
                 exported.append(obj.name)
             except Exception as e:
                 skipped.append(obj.name)
@@ -1012,22 +920,23 @@ class HIST_OT_BatchExport(Operator):
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
-
 # ---------------------------------------------------------------------------
 # Drawing helpers
 # ---------------------------------------------------------------------------
 
 def draw_url_field(layout, src, editable=True):
-    row = layout.row(align=True)
+    row      = layout.row(align=True)
     text_col = row.row(align=True)
     text_col.enabled = editable
     text_col.prop(src, "url")
     if is_url(src.url):
-        op = row.operator("hist.open_url", text="", icon="URL")
+        op     = row.operator("hist.open_url", text="", icon="URL")
         op.url = src.url
 
-def draw_source_fields_editable(layout, src):
-    col = layout.column(align=True)
+def draw_source_fields(layout, src, editable=True):
+    """Unified editable/readonly source field drawing."""
+    col         = layout.column(align=True)
+    col.enabled = editable
     col.prop(src, "title")
     row = col.row(align=True)
     row.prop(src, "source_type")
@@ -1039,31 +948,13 @@ def draw_source_fields_editable(layout, src):
     col.separator()
     col.prop(src, "description")
     col.prop(src, "notes")
-    draw_url_field(layout, src, editable=True)
-
-def draw_source_fields_readonly(layout, src):
-    col = layout.column(align=True)
-    col.enabled = False
-    col.prop(src, "title")
-    row = col.row(align=True)
-    row.prop(src, "source_type")
-    row.prop(src, "reliability")
-    col.prop(src, "date")
-    col.prop(src, "toponym")
-    col.prop(src, "repository")
-    col.prop(src, "inventory_nr")
-    col.separator()
-    col.prop(src, "description")
-    col.prop(src, "notes")
-    draw_url_field(layout, src, editable=False)
-
+    draw_url_field(layout, src, editable=editable)
 
 # ---------------------------------------------------------------------------
 # Panels
 # ---------------------------------------------------------------------------
 
 SIDEBAR_CATEGORY = "Hist. Sources"
-
 
 class HIST_PT_LibraryPanel(Panel):
     bl_label       = "Source Library"
@@ -1076,20 +967,16 @@ class HIST_PT_LibraryPanel(Panel):
         layout = self.layout
         lib    = get_library(context)
 
-        # --- Sort controls ---
         row = layout.row(align=True)
         row.prop(lib, "sort_order", text="Sort")
         row.operator("hist.sort_sources", text="", icon="FILE_REFRESH")
 
-        # --- Filter section ---
         active = filters_active(lib)
-        filter_icon = "FILTER" if active else "FILTER"
-        box = layout.box()
-        row = box.row(align=True)
+        box    = layout.box()
+        row    = box.row(align=True)
         row.prop(lib, "show_filters",
                  icon="TRIA_DOWN" if lib.show_filters else "TRIA_RIGHT",
                  icon_only=True, emboss=False)
-        # Show "Filter (active)" label when filters are on
         if active:
             row.label(text="Filter  [active]", icon="FILTER")
             row.operator("hist.clear_filters", text="", icon="X")
@@ -1099,22 +986,20 @@ class HIST_PT_LibraryPanel(Panel):
         if lib.show_filters:
             col = box.column(align=True)
             col.prop(lib, "filter_inventory_nr", icon="SHORTDISPLAY")
-            col.prop(lib, "filter_title",   icon="SORTALPHA")
-            col.prop(lib, "filter_toponym", icon="WORLD")
-            col.prop(lib, "filter_date",    icon="TIME")
+            col.prop(lib, "filter_title",        icon="SORTALPHA")
+            col.prop(lib, "filter_toponym",      icon="WORLD")
+            col.prop(lib, "filter_date",         icon="TIME")
             col.prop(lib, "filter_type")
             col.prop(lib, "filter_reliability")
             if active:
                 col.separator()
                 col.operator("hist.clear_filters", icon="X", text="Clear All Filters")
 
-        # --- Filtered count hint ---
         if active:
             total   = len(lib.sources)
             visible = sum(1 for s in lib.sources if source_passes_filter(s, lib))
             layout.label(text=f"Showing {visible} of {total} sources", icon="INFO")
 
-        # --- List + side buttons ---
         row = layout.row()
         row.template_list("HIST_UL_LibraryList", "", lib, "sources", lib, "active_index", rows=6)
         col = row.column(align=True)
@@ -1129,11 +1014,10 @@ class HIST_PT_LibraryPanel(Panel):
             src = lib.sources[lib.active_index]
             box = layout.box()
             box.label(text="Edit Source", icon="GREASEPENCIL")
-            draw_source_fields_editable(box, src)
-            row = box.row()
+            draw_source_fields(box, src, editable=True)
+            row         = box.row()
             row.enabled = False
             row.prop(src, "source_id", text="ID")
-
             layout.separator()
             layout.operator("hist.link_to_selected", icon="LINKED")
 
@@ -1141,7 +1025,6 @@ class HIST_PT_LibraryPanel(Panel):
         row = layout.row(align=True)
         row.operator("hist.library_export_csv", icon="EXPORT", text="Export Library CSV")
         row.operator("hist.library_import_csv", icon="IMPORT", text="Import Library CSV")
-
 
 class HIST_PT_ObjectPanel(Panel):
     bl_label       = "Object Sources"
@@ -1167,15 +1050,14 @@ class HIST_PT_ObjectPanel(Panel):
 
         if refs.refs and 0 <= refs.active_index < len(refs.refs):
             active_ref = refs.refs[refs.active_index]
-            src = find_source_by_id(lib, active_ref.source_id)
-            box = layout.box()
+            src        = find_source_by_id(lib, active_ref.source_id)
+            box        = layout.box()
             box.label(text="Reference detail", icon="GREASEPENCIL")
             box.prop(active_ref, "part_note")
             if src:
-                draw_source_fields_readonly(box, src)
+                draw_source_fields(box, src, editable=False)
             else:
                 box.label(text="Source not found in library.", icon="ERROR")
-
 
 class HIST_PT_ImportPanel(Panel):
     bl_label       = "Import Sources from File"
@@ -1188,13 +1070,11 @@ class HIST_PT_ImportPanel(Panel):
     def draw(self, context):
         layout = self.layout
         s      = context.scene.hist_import_settings
-
         layout.prop(s, "filepath")
         col = layout.column(align=True)
         col.prop(s, "default_reliability")
         col.prop(s, "skip_duplicates")
         layout.separator()
-
         box = layout.box()
         box.label(text="Column mapping:", icon="INFO")
         col = box.column(align=True)
@@ -1210,10 +1090,8 @@ class HIST_PT_ImportPanel(Panel):
             ("Description", "description"),
         ]:
             col.label(text=f"  {excel_col}  ->  {addon_field}")
-
         layout.separator()
         layout.operator("hist.import_sources", icon="IMPORT", text="Import into Library")
-
 
 class HIST_PT_ExportPanel(Panel):
     bl_label       = "Export"
@@ -1235,7 +1113,6 @@ class HIST_PT_ExportPanel(Panel):
         layout.separator()
         layout.operator("hist.batch_export",  icon="EXPORT", text="Batch Export")
         layout.operator("hist.export_report", icon="TEXT")
-
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -1270,7 +1147,6 @@ classes = (
     HIST_PT_ExportPanel,
 )
 
-
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -1279,7 +1155,6 @@ def register():
     bpy.types.Scene.hist_import_settings = PointerProperty(type=HistImportSettings)
     bpy.types.Object.hist_source_refs    = PointerProperty(type=ObjectSourceRefs)
 
-
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
@@ -1287,7 +1162,6 @@ def unregister():
     del bpy.types.Scene.hist_export_settings
     del bpy.types.Scene.hist_import_settings
     del bpy.types.Object.hist_source_refs
-
 
 if __name__ == "__main__":
     register()
