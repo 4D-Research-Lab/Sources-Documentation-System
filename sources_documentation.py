@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Historical Source Documentation",
     "author": "Tijm Lanjouw/Claude Sonnet 4.6",
-    "version": (1, 7, 9),
+    "version": (1, 0, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Hist. Sources",
     "description": "Document historical sources for architectural reconstruction",
